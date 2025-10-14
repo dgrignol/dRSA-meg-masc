@@ -3,7 +3,8 @@ mne_bids
 openpyxl
 nibabel
 wordfreq
-sklearn
+scikit-learn
 seaborn
 matplotlib
 tqdm
+soundfile

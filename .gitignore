@@ -1,0 +1,24 @@
+# Local virtual environments
+.venv/
+
+# macOS cruft
+.DS_Store
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+
+# User configuration
+*.local
+*.log
+
+# BIDS dataset and derived outputs
+bids_anonym/
+derivatives/
+
+# Example MATLAB code and generated artefacts
+example_code/
+
+# Convenience files
+*.tmp
+
