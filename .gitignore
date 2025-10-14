@@ -19,6 +19,9 @@ derivatives/
 # Example MATLAB code and generated artefacts
 example_code/
 
+# Project documentation (PDFs, etc.)
+docs/
+
 # Convenience files
 *.tmp
 
