@@ -38,6 +38,8 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import soundfile as sf
+from matplotlib import pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
 from scipy.signal import gammatone, sosfilt, tf2sos, resample
 
 LOGGER = logging.getLogger(__name__)
@@ -52,6 +54,10 @@ class EnvelopeProduct:
     native_path: Path
     megfs_path: Path
     metadata_path: Path
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def read_repository_root() -> Path:
@@ -222,6 +228,62 @@ def build_envelope_for_run(
     return EnvelopeProduct(native_out, megfs_out, model_meta_out)
 
 
+def _downsample_for_plot(
+    data: np.ndarray, max_points: int = 10000
+) -> Tuple[np.ndarray, np.ndarray]:
+    n = len(data)
+    if n <= max_points:
+        idx = np.arange(n)
+        return idx, data
+    step = max(1, int(np.ceil(n / max_points)))
+    idx = np.arange(0, n, step)
+    return idx, data[idx]
+
+
+def generate_envelope_report(metadata_paths: Sequence[Path], report_root: Path) -> None:
+    if not metadata_paths:
+        LOGGER.info("No envelope metadata found; skipping report generation.")
+        return
+    ensure_dir(report_root)
+    report_path = report_root / "envelope_overview.pdf"
+
+    with PdfPages(report_path) as pdf:
+        for meta_path in sorted(metadata_paths):
+            metadata = json.loads(meta_path.read_text())
+            stem = meta_path.stem.replace("_metadata", "")
+            native_path = meta_path.parent / f"{stem}_native.npy"
+            meg_path = meta_path.parent / f"{stem}_megfs.npy"
+            if not native_path.exists() or not meg_path.exists():
+                LOGGER.warning("Missing envelope arrays for %s; skipping.", meta_path)
+                continue
+
+            native = np.load(native_path)
+            native_sr = float(metadata.get("audio_native_sr", 1.0))
+            meg = np.load(meg_path)
+            meg_sr = float(metadata.get("meg_sr", 1.0))
+
+            idx_native, native_vals = _downsample_for_plot(native)
+            idx_meg, meg_vals = _downsample_for_plot(meg)
+            time_native = idx_native / native_sr
+            time_meg = idx_meg / meg_sr
+
+            fig, ax = plt.subplots(figsize=(11, 3))
+            ax.plot(time_native, native_vals, label="Native envelope", alpha=0.6)
+            ax.plot(time_meg, meg_vals, label="MEG-rate envelope", alpha=0.8)
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel("Envelope (a.u.)")
+            ax.set_title(
+                f"Envelope comparison | sub-{metadata.get('subject')} "
+                f"ses-{metadata.get('session')} task-{metadata.get('task')}"
+            )
+            ax.legend(loc="upper right")
+            ax.grid(True, alpha=0.2)
+            pdf.savefig(fig)
+            plt.close(fig)
+
+    LOGGER.info("Saved envelope report to %s", report_path)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -261,15 +323,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     repo_root = read_repository_root()
     preproc_root = repo_root / "derivatives" / "preprocessed"
     models_root = repo_root / "derivatives" / "Models" / "envelope"
-    models_root.mkdir(parents=True, exist_ok=True)
+    ensure_dir(models_root)
+    report_root = repo_root / "derivatives" / "reports" / "Models" / "envelope"
+    ensure_dir(report_root)
 
     processed = 0
+    metadata_paths: List[Path] = []
     for metadata_path in find_preprocessed_runs(preproc_root, args.subjects):
-        product = build_envelope_for_run(metadata_path, preproc_root, models_root, overwrite=args.overwrite)
+        product = build_envelope_for_run(
+            metadata_path, preproc_root, models_root, overwrite=args.overwrite
+        )
         if product:
             processed += 1
+            metadata_paths.append(product.metadata_path)
 
     LOGGER.info("Finished building envelopes for %d run(s).", processed)
+    generate_envelope_report(metadata_paths, report_root)
     return 0 if processed else 1
 
 

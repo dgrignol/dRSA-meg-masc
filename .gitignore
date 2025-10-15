@@ -15,6 +15,7 @@ __pycache__/
 # BIDS dataset and derived outputs
 bids_anonym/
 derivatives/
+results/
 
 # Example MATLAB code and generated artefacts
 example_code/
@@ -24,4 +25,3 @@ docs/
 
 # Convenience files
 *.tmp
-

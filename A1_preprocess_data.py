@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import mne
 import numpy as np
 import pandas as pd
@@ -177,6 +178,59 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _downsample_for_plot(
+    values: np.ndarray, max_points: int = 10000
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return down-sampled indices and values suitable for plotting."""
+    n = len(values)
+    if n <= max_points:
+        idx = np.arange(n)
+        return idx, values
+    step = max(1, int(math.ceil(n / max_points)))
+    idx = np.arange(0, n, step)
+    return idx, values[idx]
+
+
+def create_preprocessing_report(
+    raw: mne.io.BaseRaw,
+    mask: np.ndarray,
+    metadata: dict,
+    reports_root: Path,
+    base_name: str,
+) -> Path:
+    """Generate an MNE report for the preprocessed run."""
+    subject = metadata.get("subject", "unknown")
+    session = metadata.get("session", "unknown")
+    task = metadata.get("task", "unknown")
+
+    report_dir = (
+        reports_root
+        / f"sub-{subject}"
+        / (f"ses-{session}" if session is not None else "ses-unknown")
+        / f"task-{task}"
+    )
+    ensure_dir(report_dir)
+
+    report_path = report_dir / f"{base_name}_preprocessing_report.html"
+
+    report = mne.Report(title=f"Preprocessing summary: sub-{subject} ses-{session} task-{task}")
+    report.add_raw(raw, title="Filtered MEG", psd=False, tags=("meg", "filtered"))
+
+    idx, mask_values = _downsample_for_plot(mask.astype(float))
+    times = idx / raw.info["sfreq"]
+    fig, ax = plt.subplots(figsize=(10, 2.5))
+    ax.step(times, mask_values, where="post")
+    ax.set_ylim(-0.1, 1.1)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Sentence mask")
+    ax.set_title("Sentence vs non-sentence segments")
+    report.add_figure(fig, title="Sentence mask", tags=("mask",))
+    plt.close(fig)
+
+    report.save(report_path, overwrite=True, open_browser=False)
+    return report_path
+
+
 def gather_audio_cache(
     bids_path: BIDSPath, segments: Sequence[SequenceSegment]
 ) -> Tuple[Dict[Path, Tuple[np.ndarray, int]], List[int]]:
@@ -285,6 +339,7 @@ def build_audio_timecourses(
 def preprocess_run(
     bids_path: BIDSPath,
     derivatives_root: Path,
+    reports_root: Path,
     overwrite: bool = False,
 ) -> Optional[RunProduct]:
     try:
@@ -410,6 +465,14 @@ def preprocess_run(
             "responses, etc.)."
         ),
     }
+    report_path = create_preprocessing_report(
+        preproc_raw,
+        mask,
+        metadata,
+        reports_root,
+        base_name,
+    )
+    metadata["reports"] = {"preprocessing_html": str(report_path)}
     metadata_path.write_text(json.dumps(metadata, indent=2))
 
     LOGGER.info("Saved preprocessed run to %s", run_root)
@@ -498,10 +561,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     derivatives_root = repo_root / "derivatives" / "preprocessed"
     ensure_dir(derivatives_root)
+    reports_root = repo_root / "derivatives" / "reports" / "preprocessing"
+    ensure_dir(reports_root)
 
     processed = 0
     for bids_path in iter_available_runs(bids_root, args.subjects):
-        product = preprocess_run(bids_path, derivatives_root, overwrite=args.overwrite)
+        product = preprocess_run(
+            bids_path,
+            derivatives_root,
+            reports_root,
+            overwrite=args.overwrite,
+        )
         if product:
             processed += 1
 
@@ -511,4 +581,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
