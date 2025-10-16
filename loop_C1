@@ -1,0 +1,6 @@
+# run this in the terminal
+. .venv/bin/activate
+for s in {1..30}; do
+    echo "Running subject $s"
+    python C1_dRSA_run.py "$s"
+done
