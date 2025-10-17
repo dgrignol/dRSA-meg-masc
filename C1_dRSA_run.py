@@ -102,6 +102,42 @@ if wordfreq_path is None:
         + "\n".join(wordfreq_path_candidates)
     )
 
+glove_path_candidates = [
+    os.path.join(
+        repo_root,
+        "derivatives",
+        "Models",
+        "glove",
+        subject_label,
+        "concatenated",
+        f"{subject_label}_concatenated_glove_100Hz.npy",
+    )
+]
+glove_path = next((path for path in glove_path_candidates if os.path.exists(path)), None)
+if glove_path is None:
+    raise FileNotFoundError(
+        "Unable to locate a GloVe model file. Checked:\n"
+        + "\n".join(glove_path_candidates)
+    )
+
+glove_norm_path_candidates = [
+    os.path.join(
+        repo_root,
+        "derivatives",
+        "Models",
+        "glove",
+        subject_label,
+        "concatenated",
+        f"{subject_label}_concatenated_glove_100Hz_norm.npy",
+    )
+]
+glove_norm_path = next((path for path in glove_norm_path_candidates if os.path.exists(path)), None)
+if glove_norm_path is None:
+    raise FileNotFoundError(
+        "Unable to locate a GloVe norm file. Checked:\n"
+        + "\n".join(glove_norm_path_candidates)
+    )
+
 mask_paths = [
     os.path.join(
         repo_root,
@@ -158,6 +194,8 @@ def _register_model(path, label, metric):
 
 _register_model(envelope_path, "Envelope", "euclidean")
 _register_model(wordfreq_path, "Word Frequency", "euclidean")
+_register_model(glove_path, "GloVe", "correlation")
+_register_model(glove_norm_path, "GloVe Norm", "euclidean")
 
 
 # ===== settings =====
