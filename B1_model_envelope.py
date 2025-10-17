@@ -32,9 +32,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -53,13 +54,47 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class EnvelopeProduct:
+    subject: str
+    session: str
+    task: str
     native_path: Path
     megfs_path: Path
     metadata_path: Path
+    native_sr: float
+    meg_sr: float
+    native_samples: int
+    meg_samples: int
+    session_index: int
+    task_index: int
 
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def normalise_subject_label(value: str | int) -> str:
+    text = str(value)
+    if text.startswith("sub-"):
+        return text
+    return f"sub-{int(text):02d}"
+
+
+def normalise_session_label(value: str | int) -> Tuple[str, int]:
+    text = str(value)
+    if text.startswith("ses-"):
+        digits = "".join(filter(str.isdigit, text))
+        return text, int(digits) if digits else 0
+    number = int(text)
+    return f"ses-{number}", number
+
+
+def normalise_task_label(value: str | int) -> Tuple[str, int]:
+    text = str(value)
+    if text.startswith("task-"):
+        digits = "".join(filter(str.isdigit, text))
+        return text, int(digits) if digits else 0
+    number = int(text)
+    return f"task-{number}", number
 
 
 def erb_scale_freqs(f_min: float, f_max: float, n_filters: int) -> np.ndarray:
@@ -139,6 +174,9 @@ def build_envelope_for_run(
     overwrite: bool = False,
 ) -> Optional[EnvelopeProduct]:
     meta = json.loads(metadata_path.read_text())
+    subject_label = normalise_subject_label(meta.get("subject"))
+    session_label, session_index = normalise_session_label(meta.get("session"))
+    task_label, task_index = normalise_task_label(meta.get("task"))
     base_dir = metadata_path.parent
     audio_native_path = base_dir / "audio" / f"{metadata_path.stem.replace('_metadata', '')}_audio_native.wav"
     audio_meg_path = base_dir / "audio" / f"{metadata_path.stem.replace('_metadata', '')}_audio_megfs.wav"
@@ -215,7 +253,20 @@ def build_envelope_for_run(
     model_meta_out.write_text(json.dumps(model_metadata, indent=2))
 
     LOGGER.info("Saved envelope model to %s", run_root)
-    return EnvelopeProduct(native_out, megfs_out, model_meta_out)
+    return EnvelopeProduct(
+        subject=subject_label,
+        session=session_label,
+        task=task_label,
+        native_path=native_out,
+        megfs_path=megfs_out,
+        metadata_path=model_meta_out,
+        native_sr=float(native_sr),
+        meg_sr=float(meta.get("sfreq")),
+        native_samples=int(len(broadband_envelope)),
+        meg_samples=int(n_meg_samples),
+        session_index=session_index,
+        task_index=task_index,
+    )
 
 
 def _downsample_for_plot(
@@ -274,6 +325,80 @@ def generate_envelope_report(metadata_paths: Sequence[Path], report_root: Path) 
     LOGGER.info("Saved envelope report to %s", report_path)
 
 
+def concatenate_subject_envelopes(
+    subject_label: str,
+    products: Sequence[EnvelopeProduct],
+    models_root: Path,
+    overwrite: bool,
+) -> None:
+    if not products:
+        return
+
+    products_sorted = sorted(products, key=lambda p: (p.session_index, p.task_index))
+    native_parts: List[np.ndarray] = []
+    megfs_parts: List[np.ndarray] = []
+    segments_meta: List[Dict[str, object]] = []
+
+    for prod in products_sorted:
+        native_parts.append(np.load(prod.native_path))
+        megfs_parts.append(np.load(prod.megfs_path))
+        segments_meta.append(
+            {
+                "session": prod.session,
+                "task": prod.task,
+                "native_file": str(prod.native_path),
+                "megfs_file": str(prod.megfs_path),
+                "native_samples": prod.native_samples,
+                "meg_samples": prod.meg_samples,
+                "native_sr": prod.native_sr,
+                "meg_sr": prod.meg_sr,
+            }
+        )
+
+    concatenated_native = np.concatenate(native_parts, axis=-1)
+    concatenated_megfs = np.concatenate(megfs_parts, axis=-1)
+
+    subject_dir = models_root / subject_label / "concatenated"
+    ensure_dir(subject_dir)
+
+    output_paths: Dict[str, Path] = {}
+    native_path = subject_dir / f"{subject_label}_concatenated_envelope_native.npy"
+    if native_path.exists() and not overwrite:
+        LOGGER.info("Subject-level native envelope already exists for %s; skipping.", subject_label)
+    else:
+        np.save(native_path, concatenated_native.astype(np.float32, copy=False))
+        LOGGER.info("Saved native concatenated envelope for %s", subject_label)
+    output_paths["native"] = native_path
+
+    megfs_path = subject_dir / f"{subject_label}_concatenated_envelope_megfs.npy"
+    if megfs_path.exists() and not overwrite:
+        LOGGER.info("Subject-level MEG-rate envelope already exists for %s; skipping.", subject_label)
+    else:
+        np.save(megfs_path, concatenated_megfs.astype(np.float32, copy=False))
+        LOGGER.info("Saved MEG-rate concatenated envelope for %s", subject_label)
+    output_paths["megfs"] = megfs_path
+
+    metadata = {
+        "subject": subject_label,
+        "segments": segments_meta,
+        "output_files": {k: str(v) for k, v in output_paths.items()},
+        "timepoints": {
+            "native": int(concatenated_native.shape[-1]),
+            "megfs": int(concatenated_megfs.shape[-1]),
+        },
+        "sampling_rates": {
+            "native": float(products_sorted[0].native_sr),
+            "megfs": float(products_sorted[0].meg_sr),
+        },
+    }
+    metadata_path = subject_dir / f"{subject_label}_concatenated_envelope_metadata.json"
+    if metadata_path.exists() and not overwrite:
+        LOGGER.info("Concatenated envelope metadata already exists for %s; skipping.", subject_label)
+        return
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+    LOGGER.info("Saved envelope concatenation metadata for %s", subject_label)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -319,6 +444,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     processed = 0
     metadata_paths: List[Path] = []
+    subject_products: Dict[str, List[EnvelopeProduct]] = defaultdict(list)
     for metadata_path in find_preprocessed_runs(preproc_root, args.subjects):
         product = build_envelope_for_run(
             metadata_path, preproc_root, models_root, overwrite=args.overwrite
@@ -326,6 +452,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if product:
             processed += 1
             metadata_paths.append(product.metadata_path)
+            subject_products[product.subject].append(product)
+
+    for subject, products in subject_products.items():
+        concatenate_subject_envelopes(
+            subject_label=subject,
+            products=products,
+            models_root=models_root,
+            overwrite=args.overwrite,
+        )
 
     LOGGER.info("Finished building envelopes for %d run(s).", processed)
     generate_envelope_report(metadata_paths, report_root)

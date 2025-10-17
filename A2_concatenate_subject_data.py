@@ -17,6 +17,8 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
+from functions.generic_helpers import read_repository_root
+
 try:
     import mne  # type: ignore
 except ImportError as exc:
@@ -90,6 +92,12 @@ AUDIO_BACKEND = "wave"
 def log(message: str) -> None:
     """Standardized console output."""
     print(message)
+
+
+def normalise_subject_label(subject: str) -> str:
+    if subject.startswith("sub-"):
+        return subject
+    return f"sub-{int(subject):02d}"
 
 
 @dataclass
@@ -286,23 +294,6 @@ def concatenate_masks(
     return concatenated_masks
 
 
-def concatenate_envelopes(
-    segments: Sequence[SegmentInfo],
-) -> Dict[str, np.ndarray]:
-    """Concatenate acoustic envelope arrays for each available sampling space."""
-
-    envelope_values: Dict[str, List[np.ndarray]] = defaultdict(list)
-    log("Concatenating envelope arrays...")
-
-    for seg in segments:
-        for key, path in seg.envelope_paths.items():
-            envelope_values[key].append(np.load(path))
-
-    concatenated = {key: np.concatenate(value_list, axis=-1) for key, value_list in envelope_values.items()}
-    log(f"Created {len(concatenated)} concatenated envelope arrays.")
-    return concatenated
-
-
 def concatenate_audio(
     segments: Sequence[SegmentInfo], output_dir: Path, subject: str
 ) -> Dict[str, Path]:
@@ -346,8 +337,8 @@ def concatenate_audio(
 
 def validate_lengths(
     meg_data: np.ndarray,
-    envelopes: Dict[str, np.ndarray],
     masks: Dict[str, np.ndarray],
+    envelopes: Dict[str, np.ndarray] | None = None,
     skip_envelope_keys: Sequence[str] | None = None,
 ) -> None:
     """
@@ -364,15 +355,16 @@ def validate_lengths(
 
     skip_envelope_keys = tuple(skip_envelope_keys or ())
 
-    for env_name, env_data in envelopes.items():
-        if env_name in skip_envelope_keys:
-            log(f"Skipping length validation for envelope '{env_name}'")
-            continue
-        env_points = env_data.shape[-1]
-        if env_points != total_points:
-            raise ValueError(
-                f"Envelope '{env_name}' has {env_points} samples; expected {total_points} to match MEG data."
-            )
+    if envelopes:
+        for env_name, env_data in envelopes.items():
+            if env_name in skip_envelope_keys:
+                log(f"Skipping length validation for envelope '{env_name}'")
+                continue
+            env_points = env_data.shape[-1]
+            if env_points != total_points:
+                raise ValueError(
+                    f"Envelope '{env_name}' has {env_points} samples; expected {total_points} to match MEG data."
+                )
 
     for mask_name, mask_data in masks.items():
         mask_points = mask_data.shape[-1]
@@ -383,13 +375,25 @@ def validate_lengths(
     log("Length validation passed.")
 
 
+def discover_concatenated_envelopes(models_root: Path, subject: str) -> Dict[str, Path]:
+    subject_label = normalise_subject_label(subject)
+    subject_dir = models_root / subject_label / "concatenated"
+    if not subject_dir.exists():
+        return {}
+    envelope_paths: Dict[str, Path] = {}
+    for path in subject_dir.glob(f"{subject_label}_concatenated_envelope_*.npy"):
+        key = path.stem.split("_")[-1]
+        envelope_paths[key] = path
+    return envelope_paths
+
+
 def save_outputs(
     output_dir: Path,
     subject: str,
     meg_data: np.ndarray,
-    envelopes: Dict[str, np.ndarray],
     masks: Dict[str, np.ndarray],
     audio_paths: Dict[str, Path],
+    envelope_outputs: Dict[str, Path],
     segment_lengths: Sequence[int],
     segments: Sequence[SegmentInfo],
     overwrite: bool,
@@ -407,13 +411,6 @@ def save_outputs(
         raise FileExistsError(f"{meg_path} already exists. Use --overwrite to replace it.")
     np.save(meg_path, meg_data)
     log(f"Saved MEG data to {meg_path}")
-
-    for env_key, env_data in envelopes.items():
-        env_path = output_dir / f"{subject}_concatenated_envelope_{env_key}.npy"
-        if env_path.exists() and not overwrite:
-            raise FileExistsError(f"{env_path} already exists. Use --overwrite to replace it.")
-        np.save(env_path, env_data)
-        log(f"Saved envelope '{env_key}' to {env_path}")
 
     mask_output_paths: Dict[str, Path] = {}
     for mask_name, mask_data in masks.items():
@@ -450,7 +447,7 @@ def save_outputs(
         ],
         "output_files": {
             "meg": str(meg_path),
-            "envelopes": {k: str(output_dir / f"{subject}_concatenated_envelope_{k}.npy") for k in envelopes},
+            "envelopes": {k: str(path) for k, path in envelope_outputs.items()},
             "masks": {name: str(path) for name, path in mask_output_paths.items()},
             "audio": {k: str(path) for k, path in audio_paths.items()},
         },
@@ -463,24 +460,37 @@ def main() -> None:
     """Orchestrate the concatenation workflow for the requested subject."""
 
     args = parse_args()
-    subject_dir = args.derivatives_root / "preprocessed" / args.subject
-    envelope_root = args.derivatives_root / "Models" / "envelope" / args.subject
+    repo_root = read_repository_root()
+    derivatives_root = args.derivatives_root
+    if not derivatives_root.is_absolute():
+        derivatives_root = (repo_root / derivatives_root).resolve()
+
+    subject_label = normalise_subject_label(args.subject)
+    subject_dir = derivatives_root / "preprocessed" / subject_label
+    envelope_root = derivatives_root / "Models" / "envelope" / subject_label
     output_dir = subject_dir / "concatenated"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     segments = collect_segments(subject_dir, envelope_root)
     meg_data, segment_lengths, _ = concatenate_meg(segments)
     masks = concatenate_masks(segments, segment_lengths)
-    envelopes = concatenate_envelopes(segments)
-    validate_lengths(meg_data, envelopes, masks, skip_envelope_keys=("native",))
-    audio_paths = concatenate_audio(segments, output_dir, args.subject)
+
+    models_envelope_root = derivatives_root / "Models" / "envelope"
+    envelope_outputs = discover_concatenated_envelopes(models_envelope_root, subject_label)
+    envelopes_for_validation: Dict[str, np.ndarray] = {}
+    megfs_envelope_path = envelope_outputs.get("megfs")
+    if megfs_envelope_path and megfs_envelope_path.exists():
+        envelopes_for_validation["megfs"] = np.load(megfs_envelope_path)
+    validate_lengths(meg_data, masks, envelopes=envelopes_for_validation, skip_envelope_keys=("native",))
+
+    audio_paths = concatenate_audio(segments, output_dir, subject_label)
     save_outputs(
         output_dir=output_dir,
-        subject=args.subject,
+        subject=subject_label,
         meg_data=meg_data,
-        envelopes=envelopes,
         masks=masks,
         audio_paths=audio_paths,
+        envelope_outputs=envelope_outputs,
         segment_lengths=segment_lengths,
         segments=segments,
         overwrite=args.overwrite,

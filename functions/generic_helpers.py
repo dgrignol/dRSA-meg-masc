@@ -32,7 +32,7 @@ def read_repository_root() -> Path:
     for candidate in _iter_candidate_paths(pointer):
         path = Path(candidate).expanduser().resolve()
         tried.append(path)
-        if path.exists():
+        if path.exists() and (path / "data_path.txt").exists():
             return path
 
     tried_str = ", ".join(str(p) for p in tried) if tried else "<no candidates>"
