@@ -42,6 +42,8 @@ from matplotlib import pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy.signal import gammatone, sosfilt, tf2sos, resample
 
+from functions.generic_helpers import read_repository_root
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -58,18 +60,6 @@ class EnvelopeProduct:
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-
-
-def read_repository_root() -> Path:
-    pointer = Path("data_path.txt")
-    if not pointer.exists():
-        raise FileNotFoundError(
-            "data_path.txt is missing. Create the file with the absolute path to the repository root."
-        )
-    root = Path(pointer.read_text().strip()).expanduser().resolve()
-    if not root.exists():
-        raise FileNotFoundError(f"Repository root does not exist: {root}")
-    return root
 
 
 def erb_scale_freqs(f_min: float, f_max: float, n_filters: int) -> np.ndarray:
