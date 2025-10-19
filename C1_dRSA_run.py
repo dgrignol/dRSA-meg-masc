@@ -52,8 +52,13 @@ repo_root = read_repository_root()
 
 # ===== load data =====
 # paths
-subject = int(sys.argv[1])
-subject_label = f"sub-{subject:02d}"
+subject_arg = sys.argv[1]
+if subject_arg.startswith("sub-"):
+    subject_label = subject_arg
+    subject = int(subject_arg.split("-")[1])
+else:
+    subject = int(subject_arg)
+    subject_label = f"sub-{subject:02d}"
 session_label = "all"#"ses-0"
 task_label = "all"#"task-0"
 print(f"subject: {subject}")
@@ -64,14 +69,6 @@ envelope_path_candidates = [
         "derivatives",
         "Models",
         "envelope",
-        subject_label,
-        "concatenated",
-        f"{subject_label}_concatenated_envelope_100Hz.npy",
-    ),
-    os.path.join(
-        repo_root,
-        "derivatives",
-        "preprocessed",
         subject_label,
         "concatenated",
         f"{subject_label}_concatenated_envelope_100Hz.npy",
@@ -177,7 +174,18 @@ selected_models = []
 selected_models_labels = []
 model_rdm_metrics = []
 
+model_filter_env = os.getenv("DRSA_MODELS")
+if model_filter_env:
+    model_filter = {
+        token.strip().lower() for token in model_filter_env.split(",") if token.strip()
+    }
+else:
+    model_filter = None
+
+
 def _register_model(path, label, metric):
+    if model_filter and label.lower() not in model_filter:
+        return
     if not os.path.exists(path):
         raise FileNotFoundError(f"Model file not found: {path}")
     model = np.load(path)
@@ -275,7 +283,7 @@ analysis_parameters = {
 
 results_dir = "results"
 os.makedirs(results_dir, exist_ok=True)
-analysis_run_id = f"sub{subject}_res{resolution}_{rsa_computation_method}"
+analysis_run_id = f"{subject_label}_res{resolution}_{rsa_computation_method}"
 rsa_matrices_path = os.path.join(results_dir, f"{analysis_run_id}_dRSA_matrices.npy")
 metadata_path = os.path.join(results_dir, f"{analysis_run_id}_metadata.json")
 plot_path = os.path.join(results_dir, f"{analysis_run_id}_plot.png")

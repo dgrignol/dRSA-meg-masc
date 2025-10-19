@@ -1,9 +1,9 @@
 """Command-line helper for downsampling concatenated MEG derivatives.
 
-The script resamples MEG sensor data, acoustic envelopes, and quality-control
-masks to a lower sampling rate. Downsampling is done in a conservative manner:
-it uses polyphase filtering for the continuous signals and logical AND across
-blocks for the binary masks to ensure that previously excluded samples remain
+The script resamples MEG sensor data and quality-control masks to a lower
+sampling rate. Downsampling is done in a conservative manner: it uses
+polyphase filtering for the continuous signals and logical AND across blocks
+for the binary masks to ensure that previously excluded samples remain
 masked. A companion plotting helper is also provided so specific time windows
 can be inspected without repeating the resampling procedure.
 """
@@ -18,7 +18,6 @@ import numpy as np
 from scipy.signal import resample_poly
 
 from functions.generic_helpers import read_repository_root
-import soundfile as sf
 from fractions import Fraction
 
 
@@ -218,22 +217,6 @@ def resample_subject(config: ResampleConfig, overwrite: bool) -> Dict[str, Tuple
     ensure_output(meg_out, overwrite)
     np.save(meg_out, resampled_meg)
     out_info["meg"] = (meg, resampled_meg)
-
-    # Envelope: resample from the native (high-rate) version only.
-    native_env_path = config.concatenated_dir / f"{subject}_concatenated_envelope_native.npy"
-    if native_env_path.exists():
-        audio_native_path = config.concatenated_dir / f"{subject}_concatenated_audio_native.wav"
-        if not audio_native_path.exists():
-            raise FileNotFoundError(
-                f"Native audio required to infer sampling rate is missing: {audio_native_path}"
-            )
-        native_sr = sf.info(str(audio_native_path)).samplerate
-        envelope_native = np.load(native_env_path)
-        resampled_env = resample_timeseries(envelope_native, native_sr, config.target_rate)
-        env_out_path = config.concatenated_dir / f"{subject}_concatenated_envelope_{suffix}.npy"
-        ensure_output(env_out_path, overwrite)
-        np.save(env_out_path, resampled_env)
-        out_info["envelope"] = (envelope_native, resampled_env)
 
     # Masks
     sentence_mask_path = config.concatenated_dir / f"{subject}_concatenated_sentence_mask.npy"

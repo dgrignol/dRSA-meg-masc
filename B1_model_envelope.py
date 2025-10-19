@@ -150,6 +150,15 @@ def resample_to_meg(envelope: np.ndarray, native_sr: float, meg_sr: float, n_meg
     return env_meg
 
 
+def resample_to_rate(series: np.ndarray, source_rate: float, target_rate: float) -> np.ndarray:
+    """Resample a 1-D series to the desired sampling rate."""
+
+    if np.isclose(source_rate, target_rate):
+        return series.copy()
+    target_samples = max(1, int(round(series.shape[-1] * target_rate / source_rate)))
+    return resample(series, target_samples)
+
+
 # ---------------------------------------------------------------------------
 # Core processing
 # ---------------------------------------------------------------------------
@@ -357,6 +366,12 @@ def concatenate_subject_envelopes(
 
     concatenated_native = np.concatenate(native_parts, axis=-1)
     concatenated_megfs = np.concatenate(megfs_parts, axis=-1)
+    target_rate = 100.0
+    concatenated_100Hz = resample_to_rate(
+        concatenated_megfs,
+        source_rate=float(products_sorted[0].meg_sr),
+        target_rate=target_rate,
+    )
 
     subject_dir = models_root / subject_label / "concatenated"
     ensure_dir(subject_dir)
@@ -378,6 +393,15 @@ def concatenate_subject_envelopes(
         LOGGER.info("Saved MEG-rate concatenated envelope for %s", subject_label)
     output_paths["megfs"] = megfs_path
 
+    hundred_path = subject_dir / f"{subject_label}_concatenated_envelope_100Hz.npy"
+    if hundred_path.exists() and not overwrite:
+        LOGGER.info("100 Hz envelope already exists for %s; skipping.", subject_label)
+        concatenated_100Hz = np.load(hundred_path)
+    else:
+        np.save(hundred_path, concatenated_100Hz.astype(np.float32, copy=False))
+        LOGGER.info("Saved 100 Hz concatenated envelope for %s", subject_label)
+    output_paths["100Hz"] = hundred_path
+
     metadata = {
         "subject": subject_label,
         "segments": segments_meta,
@@ -385,10 +409,12 @@ def concatenate_subject_envelopes(
         "timepoints": {
             "native": int(concatenated_native.shape[-1]),
             "megfs": int(concatenated_megfs.shape[-1]),
+            "100Hz": int(concatenated_100Hz.shape[-1]),
         },
         "sampling_rates": {
             "native": float(products_sorted[0].native_sr),
             "megfs": float(products_sorted[0].meg_sr),
+            "100Hz": target_rate,
         },
     }
     metadata_path = subject_dir / f"{subject_label}_concatenated_envelope_metadata.json"
