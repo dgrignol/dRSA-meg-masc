@@ -12,6 +12,9 @@ __pycache__/
 *.local
 *.log
 
+# Local run logs
+logs/
+
 # BIDS dataset and derived outputs
 bids_anonym/
 derivatives/
