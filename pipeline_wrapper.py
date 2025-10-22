@@ -140,7 +140,7 @@ def discover_group_subjects(results_dir: Path, lag_metric: str) -> List[str]:
     """Infer subjects for D1 by scanning the results directory."""
 
     pattern = re.compile(
-        rf"sub(\d+)_res\d+_{re.escape(lag_metric)}_dRSA_matrices\.npy$", re.IGNORECASE
+        rf"sub-?(\d+)_res\d+_{re.escape(lag_metric)}_dRSA_matrices\.npy$", re.IGNORECASE
     )
     subjects: set[int] = set()
 
@@ -256,11 +256,15 @@ def step_b1(ctx: PipelineContext) -> List[CommandSpec]:
 
 def step_b2(ctx: PipelineContext) -> List[CommandSpec]:
     command = _build_subject_step("B2_wordfreq.py", "B2_wordfreq", ctx)
+    if command:
+        command.argv.extend(["--target-rate", "100"])
     return [command] if command else []
 
 
 def step_b3(ctx: PipelineContext) -> List[CommandSpec]:
     command = _build_subject_step("B3_voicing.py", "B3_voicing", ctx)
+    if command:
+        command.argv.extend(["--target-rate", "100"])
     return [command] if command else []
 
 
@@ -278,6 +282,7 @@ def step_b4(ctx: PipelineContext) -> List[CommandSpec]:
     ]
     if ctx.subject_ids:
         argv.extend(["--subjects", *ctx.subject_ids])
+    argv.extend(["--target-rate", "100"])
     if ctx.overwrite:
         argv.append("--overwrite")
     return [CommandSpec("B4_glove", argv)]

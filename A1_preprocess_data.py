@@ -35,7 +35,7 @@ import soundfile as sf
 from mne_bids import BIDSPath, read_raw_bids
 from scipy.signal import resample
 
-from functions.generic_helpers import read_repository_root
+from functions.generic_helpers import read_repository_root, resolve_relative_path_casefold
 
 LOGGER = logging.getLogger(__name__)
 
@@ -176,6 +176,19 @@ def _downsample_for_plot(
     return idx, values[idx]
 
 
+def resolve_audio_path(bids_root: Path, sound_path: Optional[str]) -> Optional[Path]:
+    """
+    Resolve ``sound_path`` within the BIDS root, tolerating case differences.
+    """
+
+    if not sound_path:
+        return None
+    resolved = resolve_relative_path_casefold(bids_root, sound_path)
+    if resolved is not None and resolved.exists():
+        return resolved.resolve()
+    return None
+
+
 def create_preprocessing_report(
     raw: mne.io.BaseRaw,
     mask: np.ndarray,
@@ -221,12 +234,16 @@ def gather_audio_cache(
 ) -> Tuple[Dict[Path, Tuple[np.ndarray, int]], List[int]]:
     cache: Dict[Path, Tuple[np.ndarray, int]] = {}
     sample_rates: List[int] = []
+    bids_root = Path(bids_path.root)
     for seg in segments:
         if not seg.sound_path:
             continue
-        audio_path = (bids_path.root / seg.sound_path).resolve()
-        if not audio_path.exists():
-            LOGGER.warning("Audio file missing on disk: %s", audio_path)
+        audio_path = resolve_audio_path(bids_root, seg.sound_path)
+        if audio_path is None:
+            expected_path = Path(seg.sound_path)
+            if not expected_path.is_absolute():
+                expected_path = bids_root / expected_path
+            LOGGER.warning("Audio file missing on disk: %s", expected_path)
             continue
         if audio_path not in cache:
             data, sr = sf.read(audio_path, always_2d=False)
@@ -280,12 +297,13 @@ def build_audio_timecourses(
     native_len = int(round(duration * base_sr))
     audio_native = np.zeros(native_len, dtype=np.float64)
     audio_meg = np.zeros(n_times, dtype=np.float64)
+    bids_root = Path(bids_path.root)
 
     for seg in segments:
         if not seg.sound_path or seg.audio_onset is None or seg.audio_offset is None:
             continue
-        audio_path = (bids_path.root / seg.sound_path).resolve()
-        if audio_path not in audio_cache:
+        audio_path = resolve_audio_path(bids_root, seg.sound_path)
+        if audio_path is None or audio_path not in audio_cache:
             continue
         clip, sr = audio_cache[audio_path]
         start_idx = int(round(seg.audio_onset * sr))

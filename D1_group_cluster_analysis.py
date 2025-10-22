@@ -9,8 +9,8 @@ for each model alongside the grand-average lag curve (with SEM shading) and
 highlights significant clusters on the lag axis.
 
 Expected per-subject files (per model):
-    results/sub{ID}_res100_correlation_dRSA_matrices.npy
-    results/sub{ID}_res100_correlation_metadata.json
+    results/sub-{ID}_res100_correlation_dRSA_matrices.npy
+    results/sub-{ID}_res100_correlation_metadata.json
 
 Usage
 -----
@@ -106,12 +106,28 @@ def load_subject_data(
     lag_metric: str,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     subject_id = int(subject)
-    base = results_dir / f"sub{subject_id}_res100_{lag_metric}"
-    matrices_path = Path(f"{base}_dRSA_matrices.npy")
-    meta_path = Path(f"{base}_metadata.json")
+    prefix_candidates = [
+        f"sub-{subject_id:02d}_res100_{lag_metric}",
+        f"sub{subject_id}_res100_{lag_metric}",
+    ]
 
-    if not matrices_path.exists() or not meta_path.exists():
-        raise FileNotFoundError(f"Missing dRSA outputs for subject {subject} under {base}")
+    matrices_path: Optional[Path] = None
+    meta_path: Optional[Path] = None
+
+    for prefix in prefix_candidates:
+        candidate_matrix = results_dir / f"{prefix}_dRSA_matrices.npy"
+        candidate_meta = results_dir / f"{prefix}_metadata.json"
+        if candidate_matrix.exists() and candidate_meta.exists():
+            matrices_path = candidate_matrix
+            meta_path = candidate_meta
+            break
+
+    if matrices_path is None or meta_path is None:
+        expected = ", ".join(prefix_candidates)
+        raise FileNotFoundError(
+            f"Missing dRSA outputs for subject {subject} in {results_dir} "
+            f"(expected prefixes: {expected})"
+        )
 
     matrices = np.load(matrices_path)
     metadata = json.loads(meta_path.read_text())
