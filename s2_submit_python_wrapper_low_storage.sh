@@ -31,7 +31,7 @@ which python
 
 # --- Run the low-storage wrapper
 python pipeline_wrapper_low_storage.py \
-  --subjects 1-23 \
+  --subjects 24-27 \
   --glove-path "$GLOVE" \
   --continue-on-error \
   --keep-reports
