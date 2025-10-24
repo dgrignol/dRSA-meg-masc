@@ -41,7 +41,7 @@ from functions.generic_helpers import read_repository_root
 LOGGER = logging.getLogger("pipeline_wrapper")
 
 
-DEFAULT_MODELS = ["Envelope", "Word Frequency", "GloVe", "GloVe Norm"]
+DEFAULT_MODELS = ["Envelope", "Phoneme Voicing", "Word Frequency", "GloVe", "GloVe Norm"]
 
 
 @dataclass

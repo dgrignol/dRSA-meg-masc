@@ -35,6 +35,7 @@ from typing import Iterable, List, Optional, Sequence
 from functions.generic_helpers import read_repository_root
 from pipeline_wrapper import (
     DEFAULT_MODELS,
+    discover_group_subjects,
     parse_subject_tokens,
     resolve_glove_path,
 )
@@ -58,30 +59,66 @@ def run_command(label: str, argv: Sequence[str], cwd: Path, continue_on_error: b
 
 
 def cleanup_subject_derivatives(repo_root: Path, subject_label: str, remove_reports: bool) -> None:
-    """Delete derivative directories associated with a subject."""
+    """
+    Delete bulky intermediate files for ``subject_label`` while keeping the
+    100 Hz concatenates and model trajectories needed for future dRSA runs.
+    """
 
     derivatives_root = repo_root / "derivatives"
-    candidate_dirs: List[Path] = [
-        derivatives_root / "preprocessed" / subject_label,
-        derivatives_root / "Models" / "envelope" / subject_label,
-        derivatives_root / "Models" / "wordfreq" / subject_label,
-        derivatives_root / "Models" / "voicing" / subject_label,
-        derivatives_root / "Models" / "glove" / subject_label,
-    ]
-    if remove_reports:
-        candidate_dirs.extend(
-            [
-                derivatives_root / "reports" / "preprocessing" / subject_label,
-                derivatives_root / "reports" / "Models" / "envelope" / subject_label,
-                derivatives_root / "reports" / "Models" / "wordfreq" / subject_label,
-                derivatives_root / "reports" / "Models" / "voicing" / subject_label,
-            ]
+    preproc_subject_dir = derivatives_root / "preprocessed" / subject_label
+
+    def _collect(paths: Iterable[Path]) -> List[Path]:
+        return [path for path in paths if path.exists()]
+
+    removal_map: List[tuple[str, List[Path]]] = []
+
+    if preproc_subject_dir.exists():
+        concatenated_dir = preproc_subject_dir / "concatenated"
+        removal_map.append(
+            (
+                "concatenated MEG (native rate)",
+                _collect(concatenated_dir.glob(f"{subject_label}_concatenated_meg.npy")),
+            )
+        )
+        removal_map.append(
+            (
+                "run-level preprocessed FIF",
+                _collect(preproc_subject_dir.glob("ses-*/task-*/meg/*.fif")),
+            )
         )
 
-    for directory in candidate_dirs:
-        if directory.exists():
-            LOGGER.debug("Removing %s", directory)
-            shutil.rmtree(directory, ignore_errors=True)
+    model_root = derivatives_root / "Models"
+    model_patterns: List[tuple[str, Path, str]] = [
+        ("envelope native arrays", model_root / "envelope" / subject_label, "**/*_envelope_native.npy"),
+        ("envelope MEG-rate arrays", model_root / "envelope" / subject_label, "**/*_envelope_megfs.npy"),
+        ("wordfreq MEG-rate arrays", model_root / "wordfreq" / subject_label, "**/*_wordfreq_megfs.npy"),
+        ("voicing MEG-rate arrays", model_root / "voicing" / subject_label, "**/*_voicing_megfs.npy"),
+    ]
+    for description, base_dir, pattern in model_patterns:
+        if base_dir.exists():
+            removal_map.append((description, _collect(base_dir.glob(pattern))))
+
+    for description, paths in removal_map:
+        for target in sorted(paths):
+            if not target.is_file():
+                continue
+            try:
+                target.unlink()
+                LOGGER.debug("Removed %s: %s", description, target)
+            except OSError as exc:
+                LOGGER.warning("Failed to remove %s (%s): %s", description, target, exc)
+
+    if remove_reports:
+        report_dirs = [
+            derivatives_root / "reports" / "preprocessing" / subject_label,
+            derivatives_root / "reports" / "Models" / "envelope" / subject_label,
+            derivatives_root / "reports" / "Models" / "wordfreq" / subject_label,
+            derivatives_root / "reports" / "Models" / "voicing" / subject_label,
+        ]
+        for directory in report_dirs:
+            if directory.exists():
+                LOGGER.debug("Removing report directory %s", directory)
+                shutil.rmtree(directory, ignore_errors=True)
 
 
 def build_subject_commands(
@@ -285,16 +322,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ", ".join(failed_subjects),
         )
 
-    if not processed_subjects:
-        LOGGER.error("No subjects completed successfully; skipping D1.")
+    available_subjects = discover_group_subjects(results_dir, args.lag_metric)
+    if not available_subjects:
+        LOGGER.error(
+            "No subject results found in %s matching '*_res*_%s_dRSA_matrices.npy'; skipping D1.",
+            results_dir,
+            args.lag_metric,
+        )
         return 1
 
-    LOGGER.info("=== Running D1 on %s ===", ", ".join(f"sub-{sid}" for sid in processed_subjects))
+    missing_from_results = sorted(set(processed_subjects) - set(available_subjects))
+    if missing_from_results:
+        LOGGER.warning(
+            "The following processed subjects did not produce D1 inputs and will be skipped: %s",
+            ", ".join(f"sub-{sid}" for sid in missing_from_results),
+        )
+
+    LOGGER.info("=== Running D1 on %s ===", ", ".join(f"sub-{sid}" for sid in available_subjects))
     d1_command: List[str] = [
         python_executable,
         "D1_group_cluster_analysis.py",
         "--subjects",
-        *processed_subjects,
+        *available_subjects,
         "--models",
         *args.models,
         "--lag-metric",

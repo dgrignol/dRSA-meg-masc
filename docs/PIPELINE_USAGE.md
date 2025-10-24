@@ -184,7 +184,7 @@ Runs every step (A1→D1) for the chosen subjects without deleting intermediates
   ```
 
 ### pipeline_wrapper_low_storage.py – sequential, low-footprint mode
-Processes subjects one at a time, deleting derivatives after C1 to save disk space, then runs D1 on the successful subset.
+Processes subjects one at a time, pruning bulky intermediates after C1 (native-rate concatenates, run-level FIF files, and redundant model arrays) while keeping the 100 Hz subject-level data needed for future dRSA reruns. After the per-subject loop it runs D1 on the successful subset.
 
 - **Essential options**
   - `--subjects …` (required) – same syntax as the full wrapper.
@@ -201,7 +201,7 @@ Processes subjects one at a time, deleting derivatives after C1 to save disk spa
     --continue-on-error \
     --keep-reports
 
-  # Debug a single subject without deleting derivatives
+  # Debug a single subject without deleting any derivatives
   python pipeline_wrapper_low_storage.py \
     --subjects 07 \
     --glove-path /data/glove.6B.300d.txt \
@@ -212,12 +212,12 @@ Processes subjects one at a time, deleting derivatives after C1 to save disk spa
 
 ## 4. Cluster submission scripts
 
-Two helper scripts (`s2_submit_python_wrapper.sh` and `s2_submit_python_wrapper_low_storage.sh`) illustrate how to launch the pipeline on an SGE cluster.
+Two helper scripts (`s2_submit_python_wrapper.sh` OUTDATED and `s2_submit_python_wrapper_low_storage.sh`) illustrate how to launch the pipeline on an SGE cluster.
 
 1. **Adjust paths** – edit `WD` to point at the repository root on the cluster file system, and update `GLOVE` if needed.
 2. **Environment** – both scripts activate a `micromamba` environment named `drsa311`. Replace the activation block if you use a different manager or env name.
 3. **Resources** – tweak the `#$` directives (`-pe`, `-l h_vmem`, etc.) to match your cluster quota.
-4. **Command** – the last block invokes either `pipeline_wrapper.py` or `pipeline_wrapper_low_storage.py`. Modify arguments just as you would when running locally.
+4. **Command** – the last block invokes either `pipeline_wrapper.py` (OUTDATED) or `pipeline_wrapper_low_storage.py`. Modify arguments just as you would when running locally.
 5. **Submission** – make the script executable (`chmod +x s2_submit_python_wrapper.sh`) and submit it:
    ```bash
    qsub s2_submit_python_wrapper.sh

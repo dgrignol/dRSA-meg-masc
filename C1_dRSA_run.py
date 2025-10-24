@@ -154,6 +154,20 @@ mask_paths = [
     ),
 ]
 
+voicing_path_candidates = [
+    os.path.join(
+        repo_root,
+        "derivatives",
+        "Models",
+        "voicing",
+        subject_label,
+        "concatenated",
+        f"{subject_label}_concatenated_voicing_100Hz.npy",
+    )
+]
+voicing_path = next((path for path in voicing_path_candidates if os.path.exists(path)), None)
+
+
 MEG_path = os.path.join(
     repo_root,
     "derivatives",
@@ -201,6 +215,7 @@ def _register_model(path, label, metric):
     model_paths[label] = path
 
 _register_model(envelope_path, "Envelope", "euclidean")
+_register_model(voicing_path, "Phoneme Voicing", "euclidean")
 _register_model(wordfreq_path, "Word Frequency", "euclidean")
 _register_model(glove_path, "GloVe", "correlation")
 _register_model(glove_norm_path, "GloVe Norm", "euclidean")

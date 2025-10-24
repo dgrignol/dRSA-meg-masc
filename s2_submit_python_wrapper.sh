@@ -31,5 +31,5 @@ which python
 
 # --- Run your exact command
 python pipeline_wrapper.py \
-  --subjects 2-23 \
+  --subjects 1 \
   --glove-path "$GLOVE"
