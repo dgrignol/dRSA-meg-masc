@@ -7,6 +7,12 @@ This document summarises how to run the MEG-MASC processing scripts shipped with
 ## 1. Prerequisites
 
 - **Python environment** – install dependencies with `pip install -r requirements.txt`. Most scripts rely on `mne`, `numpy`, `scipy`, `matplotlib`, and a handful of audio/text libraries.
+Locally you can use: 
+`cd /Volumes/MORWUR/Projects/DAMIANO/SpeDiction/meg-masc`
+`PYTHONPATH=".venv/lib/python3.13/site-packages"`
+Then run your script e.g. `python D1_group_cluster_analysis.py --subjects $(seq -w 1 2)` etc...
+On the cluster, you activate the micromamba env: `micromamba activate drsa311   # or whichever env has Python 3`
+Then run your script.
 - **Data layout** – the anonymised BIDS dataset must live in `bids_anonym/`. All derivatives are created inside `derivatives/`, and dRSA outputs are written to `results/`.
 - **GloVe embeddings** – scripts that touch word embeddings (B4 and the wrappers) require a plain-text GloVe file (e.g. `glove.6B.300d.txt`). Store its path in `glove_path.txt`, set `$GLOVE_PATH`, or pass `--glove-path`.
 

@@ -30,6 +30,7 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Any
+import os
 
 import numpy as np
 from matplotlib import pyplot as plt
@@ -117,6 +118,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _label_to_filename_fragment(label: str) -> str:
+    fragment = str(label).replace(" ", "_")
+    fragment = fragment.replace(os.sep, "_").replace("/", "_").strip("_")
+    return fragment or "neural"
+
+
 def load_subject_data(
     subject: str,
     models: Sequence[str],
@@ -174,6 +181,45 @@ def load_subject_data(
     if labels is None:
         raise KeyError(f"selected_model_labels missing in {meta_path}")
 
+    matrices = np.asarray(matrices)
+    if matrices.ndim < 3:
+        raise ValueError(
+            f"dRSA matrices for subject {subject} must be at least 3D; received shape {matrices.shape}."
+        )
+
+    n_models = len(labels)
+    neural_labels = metadata.get("neural_signal_labels") or []
+
+    if matrices.shape[1] == n_models:
+        n_neural = matrices.shape[0]
+        if not neural_labels:
+            neural_labels = [f"Neural {idx + 1}" for idx in range(n_neural)]
+        elif len(neural_labels) != n_neural:
+            if len(neural_labels) == 1 and n_neural > 1:
+                base_label = neural_labels[0]
+                neural_labels = [f"{base_label} {idx + 1}" for idx in range(n_neural)]
+            else:
+                raise ValueError(
+                    f"neural_signal_labels in {meta_path} has length {len(neural_labels)}, "
+                    f"but matrices provide {n_neural} neural signal sets."
+                )
+    elif matrices.shape[0] == n_models:
+        matrices = matrices[None, ...]
+        n_neural = 1
+        if not neural_labels:
+            neural_labels = ["Neural 1"]
+        elif len(neural_labels) != 1:
+            raise ValueError(
+                f"Ambiguous neural_signal_labels for subject {subject}: expected one label, found {neural_labels}."
+            )
+    else:
+        raise ValueError(
+            f"Unexpected dRSA matrix shape {matrices.shape} for subject {subject}: "
+            f"cannot reconcile with {n_models} model labels."
+        )
+
+    metadata["neural_signal_labels"] = neural_labels
+
     label_to_idx = {label: idx for idx, label in enumerate(labels)}
 
     model_indices = []
@@ -182,19 +228,32 @@ def load_subject_data(
             raise KeyError(f"Model '{model}' not found for subject {subject}; available: {labels}")
         model_indices.append(label_to_idx[model])
 
-    matrices_subset = matrices[model_indices]
+    matrices_subset = matrices[:, model_indices, ...]
 
     # Recover analysis settings required to translate lag steps into seconds.
     lag_settings = metadata["analysis_parameters"]
     adtw_in_tps = lag_settings["averaging_window_tps"]
 
-    lag_curves_subject = []
-    for matrix in matrices_subset:
-        lag_curve, _ = compute_lag_curve_from_matrix(matrix, adtw_in_tps)
-        lag_curves_subject.append(lag_curve)
-    lag_curves_subject = np.array(lag_curves_subject)
+    lag_curves_subject: List[List[np.ndarray]] = []
+    lags_tp_axis: Optional[np.ndarray] = None
+    for neural_idx in range(matrices_subset.shape[0]):
+        neural_curves = []
+        for matrix in matrices_subset[neural_idx]:
+            lag_curve, lags_tp = compute_lag_curve_from_matrix(matrix, adtw_in_tps)
+            if lags_tp_axis is None:
+                lags_tp_axis = lags_tp
+            elif lags_tp_axis.shape != lags_tp.shape or not np.array_equal(lags_tp_axis, lags_tp):
+                raise ValueError(
+                    f"Inconsistent lag axis encountered for subject {subject} across neural/model combinations."
+                )
+            neural_curves.append(lag_curve)
+        lag_curves_subject.append(neural_curves)
+    lag_curves_subject_arr = np.array(lag_curves_subject)
 
-    return matrices_subset, lag_curves_subject, metadata
+    if lags_tp_axis is None:
+        raise RuntimeError(f"Failed to compute lag axis for subject {subject}.")
+
+    return matrices_subset, lag_curves_subject_arr, metadata, lags_tp_axis
 
 
 def compute_lag_curve_from_matrix(matrix: np.ndarray, adtw_in_tps: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -297,6 +356,7 @@ def create_summary_plot(
     model_labels: Sequence[str],
     output_path: Path,
     vector_output_path: Optional[Path] = None,
+    neural_label: Optional[str] = None,
 ) -> None:
     """
     Build a figure summarising average dRSA matrices, lag curves, and significant clusters.
@@ -418,7 +478,10 @@ def create_summary_plot(
         if idx == 0:
             ax_lag.legend(loc="upper left")
 
-    fig.suptitle("Group-level dRSA summary", fontsize=14, fontweight="bold")
+    title = "Group-level dRSA summary"
+    if neural_label:
+        title = f"{title} | {neural_label}"
+    fig.suptitle(title, fontsize=14, fontweight="bold")
     fig.savefig(output_path, dpi=300)
     if vector_output_path is not None:
         fig.savefig(vector_output_path)
@@ -452,6 +515,11 @@ def main() -> int:
     summary_cache.parent.mkdir(parents=True, exist_ok=True)
     vector_output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _with_suffix(path: Path, suffix: str) -> Path:
+        if not suffix:
+            return path
+        return path.with_name(f"{path.stem}{suffix}{path.suffix}")
+
     if args.plot_only:
         # Recreate the plots directly from the cached group-level results.
         if not summary_cache.exists():
@@ -465,6 +533,12 @@ def main() -> int:
             lags_sec = cache_payload["lags_sec"]
             significance_masks = cache_payload["significance_masks"]
             model_labels = cache_payload["model_labels"].tolist()
+            neural_label = cache_payload.get("neural_label", None)
+            if isinstance(neural_label, np.ndarray):
+                try:
+                    neural_label = neural_label.item()
+                except ValueError:
+                    neural_label = neural_label.tolist()
 
         create_summary_plot(
             avg_matrices=avg_matrices,
@@ -475,6 +549,7 @@ def main() -> int:
             model_labels=model_labels,
             output_path=output_path,
             vector_output_path=vector_output_path,
+            neural_label=neural_label,
         )
         LOGGER.info(
             "Regenerated group summary figure (PNG: %s, PDF: %s) using cached results (%s).",
@@ -491,82 +566,114 @@ def main() -> int:
 
     subjects = [s.lstrip("sub-") for s in args.subjects]
     subject_data = []
+    lag_axis_reference: Optional[np.ndarray] = None
 
     for subject in subjects:
-        # Each entry of subject_data bundles the matrices, lag curves, and metadata per subject.
-        matrices, lag_curves, metadata = load_subject_data(
+        matrices, lag_curves, metadata, lags_tp_axis = load_subject_data(
             subject,
             args.models,
             results_dir,
             args.lag_metric,
         )
         subject_data.append((matrices, lag_curves, metadata))
+        if lag_axis_reference is None:
+            lag_axis_reference = lags_tp_axis
+        elif lag_axis_reference.shape != lags_tp_axis.shape or not np.array_equal(lag_axis_reference, lags_tp_axis):
+            raise ValueError(
+                "Lag axis mismatch across subjects; ensure all subjects were analysed with the same settings."
+            )
+
+    if lag_axis_reference is None:
+        raise RuntimeError("Unable to determine lag axis from subject data.")
 
     n_models = len(args.models)
     n_subjects = len(subject_data)
 
-    matrices_stack = np.array([data[0] for data in subject_data])
-    lag_curves_stack = np.array([data[1] for data in subject_data])
+    matrices_stack = np.stack([data[0] for data in subject_data], axis=0)
+    lag_curves_stack = np.stack([data[1] for data in subject_data], axis=0)
 
-    adtw_in_tps = subject_data[0][2]["analysis_parameters"]["averaging_window_tps"]
-    resolution = subject_data[0][2]["analysis_parameters"]["resolution_hz"]
-    _, lag_tp_axis = compute_lag_curve_from_matrix(subject_data[0][0][0], adtw_in_tps)
-    lags_sec = lag_tp_axis / resolution
-
-    # Collapse subject stacks into group averages and variability estimates.
-    avg_matrices = matrices_stack.mean(axis=0)
-    avg_lag_curves = lag_curves_stack.mean(axis=0)
-    sem_lag_curves = compute_sem(lag_curves_stack, axis=0)
-
-    # Run the cluster-permutation test for each model's lag curve.
-    significance_masks = []
-    for model_idx in range(n_models):
-        significant, _ = permutation_cluster_test(
-            lag_curves_stack[:, model_idx, :],
-            cluster_alpha=args.cluster_alpha,
-            permutation_alpha=args.permutation_alpha,
-            n_permutations=args.n_permutations,
+    metadata_template = subject_data[0][2]
+    neural_labels = metadata_template.get("neural_signal_labels") or [
+        f"Neural {idx + 1}" for idx in range(matrices_stack.shape[1])
+    ]
+    if len(neural_labels) != matrices_stack.shape[1]:
+        raise ValueError(
+            "Mismatch between recorded neural signal labels and data dimensions in subject metadata."
         )
-        significance_masks.append(significant)
-    significance_masks = np.array(significance_masks)
 
-    create_summary_plot(
-        avg_matrices=avg_matrices,
-        avg_lag_curves=avg_lag_curves,
-        sem_lag_curves=sem_lag_curves,
-        lags_sec=lags_sec,
-        significance_masks=significance_masks,
-        model_labels=args.models,
-        output_path=output_path,
-        vector_output_path=vector_output_path,
-    )
-    # Persist all outputs required to regenerate the figure without rerunning the cluster test.
-    analysis_settings: Dict[str, Any] = {
-        "cluster_alpha": args.cluster_alpha,
-        "permutation_alpha": args.permutation_alpha,
-        "n_permutations": args.n_permutations,
-        "lag_metric": args.lag_metric,
-        "output_path": str(output_path),
-        "vector_output_path": str(vector_output_path),
-    }
-    np.savez_compressed(
-        summary_cache,
-        avg_matrices=avg_matrices,
-        avg_lag_curves=avg_lag_curves,
-        sem_lag_curves=sem_lag_curves,
-        lags_sec=lags_sec,
-        significance_masks=significance_masks,
-        model_labels=np.array(args.models, dtype=object),
-        subjects=np.array(subjects, dtype=object),
-        analysis_settings=np.array(analysis_settings, dtype=object),
-    )
+    resolution = metadata_template["analysis_parameters"]["resolution_hz"]
+    lags_sec = lag_axis_reference / resolution
+    n_neural = matrices_stack.shape[1]
 
-    LOGGER.info(
-        "Saved group summary figure (PNG: %s, PDF: %s) and cached analysis outputs at %s.",
-        output_path,
-        vector_output_path,
-        summary_cache,
-    )
+    for neural_idx in range(n_neural):
+        neural_label = neural_labels[neural_idx]
+        suffix_fragment = _label_to_filename_fragment(neural_label)
+        suffix = f"_{suffix_fragment}"
+
+        matrices_neural = matrices_stack[:, neural_idx, ...]
+        lag_curves_neural = lag_curves_stack[:, neural_idx, ...]
+
+        avg_matrices = matrices_neural.mean(axis=0)
+        avg_lag_curves = lag_curves_neural.mean(axis=0)
+        sem_lag_curves = compute_sem(lag_curves_neural, axis=0)
+
+        significance_masks = []
+        for model_idx in range(n_models):
+            significant, _ = permutation_cluster_test(
+                lag_curves_neural[:, model_idx, :],
+                cluster_alpha=args.cluster_alpha,
+                permutation_alpha=args.permutation_alpha,
+                n_permutations=args.n_permutations,
+            )
+            significance_masks.append(significant)
+        significance_masks = np.array(significance_masks)
+
+        output_path_neural = _with_suffix(output_path, suffix)
+        vector_output_neural = _with_suffix(vector_output_path, suffix)
+        summary_cache_neural = _with_suffix(summary_cache, suffix)
+
+        create_summary_plot(
+            avg_matrices=avg_matrices,
+            avg_lag_curves=avg_lag_curves,
+            sem_lag_curves=sem_lag_curves,
+            lags_sec=lags_sec,
+            significance_masks=significance_masks,
+            model_labels=args.models,
+            output_path=output_path_neural,
+            vector_output_path=vector_output_neural,
+            neural_label=neural_label,
+        )
+
+        analysis_settings: Dict[str, Any] = {
+            "cluster_alpha": args.cluster_alpha,
+            "permutation_alpha": args.permutation_alpha,
+            "n_permutations": args.n_permutations,
+            "lag_metric": args.lag_metric,
+            "output_path": str(output_path_neural),
+            "vector_output_path": str(vector_output_neural),
+            "neural_label": neural_label,
+            "neural_index": neural_idx,
+        }
+        np.savez_compressed(
+            summary_cache_neural,
+            avg_matrices=avg_matrices,
+            avg_lag_curves=avg_lag_curves,
+            sem_lag_curves=sem_lag_curves,
+            lags_sec=lags_sec,
+            significance_masks=significance_masks,
+            model_labels=np.array(args.models, dtype=object),
+            subjects=np.array(subjects, dtype=object),
+            neural_label=np.array(neural_label, dtype=object),
+            analysis_settings=np.array(analysis_settings, dtype=object),
+        )
+
+        LOGGER.info(
+            "Saved group summary for '%s' (PNG: %s, PDF: %s) with cache at %s.",
+            neural_label,
+            output_path_neural,
+            vector_output_neural,
+            summary_cache_neural,
+        )
     return 0
 
 

@@ -1,51 +1,25 @@
-import matplotlib.pyplot as plt
-import numpy as np
 import json
 import os
 import sys
-import textwrap
+import hashlib
+
+import numpy as np
 import mne
-from functions.core_functions import subsampling_iterator, compute_lag_correlation, compute_rsa_matrix_corr, compute_rdm_series_from_indices
+from functions.core_functions import (
+    subsampling,
+    compute_rsa_matrix_corr,
+    compute_rdm_series_from_indices,
+)
 from functions.PCR_alpha import compute_rsa_matrix_PCR
 from functions.generic_helpers import read_repository_root
 
 
-def bootstrap_mean_ci(data, n_bootstraps=1000, confidence=0.95, random_state=None):
-    """
-    Compute a bootstrap confidence interval for the mean across axis=0.
-
-    Parameters
-    ----------
-    data : array-like, shape (n_samples, n_points)
-        Input sample of curves (e.g., lag correlations per iteration).
-    n_bootstraps : int
-        Number of bootstrap resamples.
-    confidence : float
-        Confidence level between 0 and 1.
-    random_state : int or np.random.Generator, optional
-        Reproducibility control.
-
-    Returns
-    -------
-    lower, upper : ndarray
-        Lower and upper bounds of the confidence interval (shape: n_points).
-    """
-    curves = np.asarray(data)
-    if curves.ndim != 2:
-        raise ValueError("`data` must be a 2D array (samples, points).")
-    if curves.shape[0] == 0:
-        raise ValueError("At least one sample is required for bootstrapping.")
-
-    rng = (random_state if isinstance(random_state, np.random.Generator)
-           else np.random.default_rng(random_state))
-    n_samples, n_points = curves.shape
-    indices = rng.integers(0, n_samples, size=(n_bootstraps, n_samples))
-    sample_means = curves[indices].mean(axis=1)
-
-    alpha = (1.0 - confidence) / 2.0
-    lower = np.percentile(sample_means, 100 * alpha, axis=0)
-    upper = np.percentile(sample_means, 100 * (1 - alpha), axis=0)
-    return lower, upper
+def compute_mask_signature(mask_array):
+    if mask_array is None:
+        return "nomask"
+    mask_bool = np.asarray(mask_array, dtype=bool)
+    packed = np.packbits(mask_bool)
+    return hashlib.sha1(packed.tobytes()).hexdigest()
 
 # repository root
 repo_root = read_repository_root()
@@ -224,7 +198,7 @@ _register_model(glove_norm_path, "GloVe Norm", "euclidean")
 # ===== settings =====
 
 save_rsa_matrices = True
-save_plots = True
+save_lag_curves = True
 
 mask = None
 if mask_paths:
@@ -249,6 +223,15 @@ lag_bootstrap_random_state = 0
 # ===== select data and set RDM metrics =====                    
 
 selected_neural_data = neural_data
+
+# Hard-coded neural subsets (currently three identical MEG datasets).
+neural_signal_sets = [
+    ("MEG Full 1", selected_neural_data),
+    ("MEG Full 2", selected_neural_data),
+    ("MEG Full 3", selected_neural_data),
+]
+
+neural_signal_labels = [label for label, _ in neural_signal_sets]
 
 selected_models = [np.atleast_2d(model) for model in selected_models]  # ensure 2D arrays. If 1D, add feature axis.
 
@@ -285,6 +268,8 @@ adtw_in_tps = averaging_diagonal_time_window_sec * resolution
 # and also, not to use the models outside the -3 +3 window for the PCR.
 subsample_tps = SubSampleDurSec * resolution # subsample size in tps - also number of RDMs calculated for each subsample
 
+subsampling_random_state = None
+
 analysis_parameters = {
     "n_subsamples": n_subsamples,
     "subsampling_iterations": subsampling_iterations,
@@ -294,6 +279,7 @@ analysis_parameters = {
     "tps": tps,
     "averaging_window_tps": adtw_in_tps,
     "subsample_tps": subsample_tps,
+    "subsampling_random_state": subsampling_random_state,
 }
 
 results_dir = "results"
@@ -302,63 +288,120 @@ analysis_run_id = f"{subject_label}_res{resolution}_{rsa_computation_method}"
 rsa_matrices_path = os.path.join(results_dir, f"{analysis_run_id}_dRSA_matrices.npy")
 metadata_path = os.path.join(results_dir, f"{analysis_run_id}_metadata.json")
 plot_path = os.path.join(results_dir, f"{analysis_run_id}_plot.png")
+lag_curves_path = os.path.join(results_dir, f"{analysis_run_id}_lag_curves.npy")
+
+cache_root = os.path.join(results_dir, "cache")
+subsample_cache_dir = os.path.join(cache_root, "subsamples")
+os.makedirs(subsample_cache_dir, exist_ok=True)
+
+mask_signature = compute_mask_signature(mask)
+subsample_cache_key = json.dumps(
+    {
+        "tps": tps,
+        "subsample_tps": subsample_tps,
+        "n_subsamples": n_subsamples,
+        "iterations": subsampling_iterations,
+        "mask_signature": mask_signature,
+        "random_state": subsampling_random_state,
+    },
+    sort_keys=True,
+)
+subsample_cache_name = hashlib.sha1(subsample_cache_key.encode("utf-8")).hexdigest()
+subsample_cache_path = os.path.join(subsample_cache_dir, f"subsamples_{subsample_cache_name}.npy")
 
 # ===== run dRSA =====
 
-subsample_iter = subsampling_iterator(
-    tps,
-    subsample_tps,
-    n_subsamples,
-    subsampling_iterations,
-    mask=mask,
-    random_state=None,
-)
-print("\u2713 subsample indices")
+if os.path.exists(subsample_cache_path):
+    subsample_indices = np.load(subsample_cache_path)
+    print(f"\u2713 loaded cached subsample indices ({subsample_cache_name})")
+else:
+    subsample_indices = subsampling(
+        tps,
+        subsample_tps,
+        n_subsamples,
+        subsampling_iterations,
+        mask=mask,
+        random_state=subsampling_random_state,
+    )
+    os.makedirs(cache_root, exist_ok=True)
+    np.save(subsample_cache_path, subsample_indices, allow_pickle=False)
+    print(f"\u2713 subsample indices (cached id {subsample_cache_name})")
 
-rsa_accumulators = [np.zeros((subsample_tps, subsample_tps), dtype=np.float32) for _ in selected_models]
-lag_curves_samples = [[] for _ in selected_models]
+rsa_accumulators = np.zeros(
+    (len(neural_signal_sets), len(selected_models), subsample_tps, subsample_tps),
+    dtype=np.float32,
+)
+lag_curves_samples = [[[] for _ in selected_models] for _ in neural_signal_sets]
 
 print("... processing subsamples and computing dRSA")
 iterations_completed = 0
-for iteration_idx, window_indices in enumerate(subsample_iter):
+for iteration_idx, window_indices in enumerate(subsample_indices):
     iterations_completed = iteration_idx + 1
 
-    neural_rdm = compute_rdm_series_from_indices(selected_neural_data, window_indices, neural_rdm_metric)
-    if not double_precision:
-        neural_rdm = neural_rdm.astype(np.float32, copy=False)
+    neural_rdm_series_per_signal = []
+    for neural_label, neural_data_array in neural_signal_sets:
+        neural_rdm = compute_rdm_series_from_indices(neural_data_array, window_indices, neural_rdm_metric)
+        if not double_precision:
+            neural_rdm = neural_rdm.astype(np.float32, copy=False)
+        neural_rdm_series_per_signal.append(neural_rdm)
 
+    model_rdm_series = []
     for model_idx, model in enumerate(selected_models):
         model_rdm = compute_rdm_series_from_indices(model, window_indices, model_rdm_metrics[model_idx])
         if not double_precision:
             model_rdm = model_rdm.astype(np.float32, copy=False)
+        model_rdm_series.append(model_rdm)
 
-        if rsa_computation_method == 'correlation':
-            rsa_matrix_it, lag_curve_it = compute_rsa_matrix_corr(
-                neural_rdm,
-                model_rdm,
-                return_lag_curves=True,
-                lag_window=adtw_in_tps,
-            )
-            rsa_accumulators[model_idx] += rsa_matrix_it
-            lag_curves_samples[model_idx].append(lag_curve_it.astype(np.float32, copy=False))
-        elif rsa_computation_method == 'PCR':
-            # PCR path requires all iterations; accumulate per iteration for later processing
-            raise NotImplementedError("Streaming PCR computation is not implemented.")
-        else:
-            raise ValueError(f"Unsupported rsa_computation_method: {rsa_computation_method}")
+    for neural_idx, neural_rdm in enumerate(neural_rdm_series_per_signal):
+        for model_idx, model_rdm in enumerate(model_rdm_series):
+            if rsa_computation_method == 'correlation':
+                rsa_matrix_it, lag_curve_it = compute_rsa_matrix_corr(
+                    neural_rdm,
+                    model_rdm,
+                    return_lag_curves=True,
+                    lag_window=adtw_in_tps,
+                )
+                rsa_accumulators[neural_idx, model_idx] += rsa_matrix_it
+                lag_curves_samples[neural_idx][model_idx].append(lag_curve_it.astype(np.float32, copy=False))
+            elif rsa_computation_method == 'PCR':
+                # PCR path requires all iterations; accumulate per iteration for later processing
+                raise NotImplementedError("Streaming PCR computation is not implemented.")
+            else:
+                raise ValueError(f"Unsupported rsa_computation_method: {rsa_computation_method}")
 
 if iterations_completed != subsampling_iterations:
     raise RuntimeError(
         f"Expected {subsampling_iterations} iterations, but processed {iterations_completed}."
     )
 
-rsa_matrices = [accumulator / iterations_completed for accumulator in rsa_accumulators]
-lag_curves_per_model = [np.stack(curves, axis=0) if curves else None for curves in lag_curves_samples]
+rsa_matrices = rsa_accumulators / iterations_completed
+lag_curves_per_signal_model = [
+    [
+        np.stack(curves, axis=0) if curves else None
+        for curves in lag_curve_list
+    ]
+    for lag_curve_list in lag_curves_samples
+]
+
+lag_curves_array = None
+lag_curves_complete = all(
+    all(curves is not None for curves in model_list)
+    for model_list in lag_curves_per_signal_model
+)
+if lag_curves_complete:
+    lag_curves_array = np.stack(
+        [np.stack(model_list, axis=0) for model_list in lag_curves_per_signal_model],
+        axis=0,
+    ).astype(np.float32, copy=False)
+    if save_lag_curves:
+        np.save(lag_curves_path, lag_curves_array)
+
 print("\u2713 compute dRSA matrices")
 
 # saving dRSA matrices:
 if save_rsa_matrices:
-    rsa_matrices_arr = np.array(rsa_matrices, dtype=float) # turn into an array
+    target_dtype = np.float64 if double_precision else np.float32
+    rsa_matrices_arr = np.asarray(rsa_matrices, dtype=target_dtype)
     np.save(rsa_matrices_path, rsa_matrices_arr)
 
 lag_bootstrap_settings = {
@@ -381,87 +424,28 @@ analysis_metadata = {
     "model_rdm_metrics": model_rdm_metrics,
     "double_precision": double_precision,
     "save_rsa_matrices": save_rsa_matrices,
-    "save_plots": save_plots,
+    "save_lag_curves": save_lag_curves,
     "analysis_parameters": analysis_parameters,
     "lag_bootstrap_settings": lag_bootstrap_settings,
     "selected_model_labels": selected_models_labels,
+    "neural_signal_labels": neural_signal_labels,
+    "subsample_cache": {
+        "id": subsample_cache_name,
+        "path": subsample_cache_path,
+    },
+    "rsa_matrix_shape": list(rsa_matrices.shape),
+    "lag_curves_shape": (
+        list(lag_curves_array.shape) if lag_curves_array is not None else None
+    ),
     "outputs": {
         "rsa_matrices": rsa_matrices_path if save_rsa_matrices else None,
-        "plot": plot_path if save_plots else None,
+        "lag_curves": (
+            lag_curves_path if save_lag_curves and lag_curves_array is not None else None
+        ),
+        "plot": None,
+        "plot_target": plot_path,
     },
 }
 
 with open(metadata_path, "w") as f:
     json.dump(analysis_metadata, f, indent=2)
-
-
-# ===== Compute lag correlations and plot =====
-
-fig, axs = plt.subplots(len(selected_models), 2, figsize=(11, 2.7 * len(selected_models)))
-
-for i, rsa_matrix in enumerate(rsa_matrices):
-    model_name = selected_models_labels[i]
-    lag_curves = lag_curves_per_model[i] if i < len(lag_curves_per_model) else None
-
-    lags_tp, lag_corr = compute_lag_correlation(rsa_matrix, adtw_in_tps)
-    ci_lower = ci_upper = None
-
-    if lag_curves is not None:
-        ci_lower, ci_upper = bootstrap_mean_ci(
-            lag_curves,
-            n_bootstraps=lag_bootstrap_iterations,
-            confidence=lag_bootstrap_confidence,
-            random_state=lag_bootstrap_random_state,
-        )
-
-    lags_sec = lags_tp / resolution
-
-    # RSA matrix plot
-    ax_matrix = axs[i, 0] if len(selected_models) > 1 else axs[0]
-    im = ax_matrix.imshow(rsa_matrix, cmap='viridis', aspect='auto')
-    ax_matrix.set_title(f'dRSA Matrix     Model: {model_name}', fontsize=8)
-    ax_matrix.set_xlabel('Model time', fontsize=7)
-    ax_matrix.set_ylabel('Neural time', fontsize=7)
-    fig.colorbar(im, ax=ax_matrix, fraction=0.046, pad=0.04)
-
-    # Lag correlation plot
-    ax_lag = axs[i, 1] if len(selected_models) > 1 else axs[1]
-    (lag_line,) = ax_lag.plot(lags_sec, lag_corr)
-    if ci_lower is not None and ci_upper is not None:
-        ax_lag.fill_between(
-            lags_sec,
-            ci_lower,
-            ci_upper,
-            color=lag_line.get_color(),
-            alpha=0.25,
-        )
-    ax_lag.axvline(0, color='gray', linestyle='--')
-    ax_lag.axhline(0, color='gray', linestyle='--')
-    # ax_lag.set_title(f'Lagged Correlation', fontsize=8)
-    ax_lag.set_xlabel('Lag (neural time - model time) [s]', fontsize=7)
-    ax_lag.set_ylabel('Correlation', fontsize=7)
-
-    # Mark the peak
-    peak_idx = np.argmax(lag_corr)            # index of maximum correlation
-    peak_lag = lags_sec[peak_idx]    # lag at maximum
-    peak_val = lag_corr[peak_idx]             # maximum correlation value
-
-    ax_lag.plot(peak_lag, peak_val, 'ro', markersize=2)    # red dot at the peak
-    ax_lag.annotate(f'Peak: {peak_val:.3f}\nLag: {peak_lag:.3f}s',
-                    xy=(peak_lag, peak_val),
-                    xytext=(peak_lag + 0.2, peak_val),  # offset text a bit
-                    arrowprops=dict(arrowstyle='->', color='red'),
-                    fontsize=7)
-
-# Clean up layout
-parameter_caption = ", ".join(f"{key}={value}" for key, value in analysis_parameters.items())
-parameter_caption = "Parameters: " + parameter_caption
-parameter_caption = textwrap.fill(parameter_caption, width=110)
-
-plt.tight_layout(rect=[0, 0.18, 1, 0.97])
-plt.subplots_adjust(hspace=0.3, wspace=0.3)
-fig.text(0.5, 0.05, parameter_caption, ha='center', va='center', fontsize=7)
-# plt.suptitle(f'dRSA Subject {subject}', fontsize=10, fontweight='bold')
-if save_plots:
-    plt.savefig(plot_path, dpi=300)
-# plt.show()
