@@ -132,34 +132,38 @@ Runs the subject-level dynamic RSA analysis.
 Aggregates subject dRSA results, performs a cluster-based permutation test, and generates summary figures.
 
 - **Input**: Subject-level outputs from C1 located in `results/`.
-- **Output** (by default in `results/group_level/`):
-  - `group_dRSA_summary.png` (raster, 300 dpi)
-  - `group_dRSA_summary.pdf` (vector export for Illustrator)
-  - `group_dRSA_summary.npz` (cache containing all aggregated arrays and settings)
+- **Output** (one set per neural signal reported in the metadata):
+  - `group_dRSA_summary_<NEURAL_LABEL>.png` (raster, 300 dpi)
+  - `group_dRSA_summary_<NEURAL_LABEL>.pdf` (vector export for Illustrator)
+  - `group_dRSA_summary_<NEURAL_LABEL>.npz` (cache containing all aggregated arrays and settings)
+
+  The `<NEURAL_LABEL>` suffix is derived from `metadata["neural_signal_labels"]` for the first subject. Spaces are converted to underscores (e.g., `MEG Full 1 → MEG_Full_1`). The figure title also includes the full label, so expect separate outputs such as `Group-level dRSA summary | MEG Full 2`. If only a single neural signal is present, the suffix still uses the label to keep filenames explicit.
+
 - **Key options**
-  - `--subjects 02 03 …` – subjects to include (e.g., `--subjects 02-23` via shell expansion or the wrappers).
-  - `--models …` – ordered model labels to average (default: `Envelope`, `Word Frequency`, `GloVe`, `GloVe Norm`).
+  - `--subjects 02 03 …` – subjects to include (e.g., `--subjects $(seq -w 1 27)`).
+  - `--models …` – ordered model labels to average; they must match the `selected_model_labels` stored in every subject’s metadata.
   - `--results-dir PATH` – location of individual subject results (default `results`).
   - `--lag-metric`, `--cluster-alpha`, `--permutation-alpha`, `--n-permutations`.
-  - `--output PATH` – base path for figures (PNG) and cache (NPZ). A PDF is emitted automatically alongside the PNG.
-  - `--summary-cache PATH` – override the cache location (defaults to `<output>.npz`).
+  - `--output PATH` – base path for figures (PNG) and cache (NPZ); the `_NEURAL_LABEL` suffix is appended automatically.
+  - `--summary-cache PATH` – override the cache location (defaults to `<output>.npz` before the suffix is added).
   - `--plot-only` – skip recomputing clusters; regenerate figures from the cache.
   - `--log-level`.
 - **Usage**
   ```bash
   # Run the full aggregation and permutation test
   python D1_group_cluster_analysis.py \
-    --subjects 02 03 04 \
-    --models Envelope "Word Frequency" GloVe "GloVe Norm" \
+    --subjects $(seq -w 1 27) \
+    --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm" \
     --results-dir results \
     --output results/group_level/group_dRSA_summary.png
 
-  # Regenerate figures from cached data
+  # Regenerate figures from cached data (one command per cache if multiple neural signals exist)
   python D1_group_cluster_analysis.py \
     --plot-only \
-    --summary-cache results/group_level/group_dRSA_summary.npz \
+    --summary-cache results/group_level/group_dRSA_summary_MEG_Full_1.npz \
     --output results/group_level/group_dRSA_summary.png
   ```
+  When using multiple neural signals, rerun the `--plot-only` command with each cache file produced during the initial analysis.
 
 ---
 
@@ -218,25 +222,34 @@ Processes subjects one at a time, pruning bulky intermediates after C1 (native-r
 
 ## 4. Cluster submission scripts
 
-Two helper scripts (`s2_submit_python_wrapper.sh` OUTDATED and `s2_submit_python_wrapper_low_storage.sh`) illustrate how to launch the pipeline on an SGE cluster.
+Three helper scripts show how to submit common workloads to SGE:
 
-1. **Adjust paths** – edit `WD` to point at the repository root on the cluster file system, and update `GLOVE` if needed.
-2. **Environment** – both scripts activate a `micromamba` environment named `drsa311`. Replace the activation block if you use a different manager or env name.
-3. **Resources** – tweak the `#$` directives (`-pe`, `-l h_vmem`, etc.) to match your cluster quota.
-4. **Command** – the last block invokes either `pipeline_wrapper.py` (OUTDATED) or `pipeline_wrapper_low_storage.py`. Modify arguments just as you would when running locally.
-5. **Submission** – make the script executable (`chmod +x s2_submit_python_wrapper.sh`) and submit it:
+- `s2_submit_python_wrapper.sh` – legacy full-pipeline submission (kept for reference).
+- `s2_submit_python_wrapper_low_storage.sh` – sequential wrapper variant that prunes intermediates after each subject.
+- `s2_submit_D1_group.sh` – runs only the group-level dRSA aggregation (D1) once all per-subject outputs exist.
+
+General checklist:
+
+1. **Adjust paths** – update `WD` (repository root on the cluster) and any resource paths such as `GLOVE`.
+2. **Environment** – the scripts assume `micromamba activate drsa311`. Swap in your own environment activation if needed.
+3. **Resources** – tweak `#$` directives (`-pe`, `-l h_vmem`, runtime limits, etc.) to match your quota and job size.
+4. **Command** – edit the final `python …` line(s) with the exact arguments you would use locally (e.g., subject list, models, permutation count).
+5. **Submission** – make the script executable (`chmod +x s2_submit_D1_group.sh`) and submit via `qsub`:
    ```bash
-   qsub s2_submit_python_wrapper.sh
-   qsub s2_submit_python_wrapper_low_storage.sh
+   qsub s2_submit_python_wrapper_low_storage.sh    # per-subject loop
+   qsub s2_submit_D1_group.sh                      # group aggregation only
    ```
-- **Example customisation** – to run only subjects 10–12 with the low-storage mode and keep derivatives:
-  ```bash
-  python pipeline_wrapper_low_storage.py \
-    --subjects 10-12 \
-    --glove-path "$GLOVE" \
-    --keep-derivatives
-  ```
-  Edit the corresponding lines in the submission script before calling `qsub`.
+
+**Example**: to run D1 over subjects 01–27 with the default model set:
+```bash
+python D1_group_cluster_analysis.py \
+  --subjects $(seq -w 1 27) \
+  --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm" \
+  --results-dir results \
+  --lag-metric correlation \
+  --output results/group_level/group_dRSA_summary.png
+```
+Mirror that command in `s2_submit_D1_group.sh` before submitting.
 
 Logs from the cluster run are written to `logs/<jobname>.<jobid>.{out,err}` as configured at the top of each script.
 
