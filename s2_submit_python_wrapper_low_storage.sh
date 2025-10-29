@@ -29,9 +29,18 @@ export PYTHONNOUSERSITE=1
 python -V
 which python
 
+analysis_name="${ANALYSIS_NAME:-drsa_${JOB_ID}}"
+if [[ -n "${ANALYSIS_NAME:-}" ]]; then
+  echo ">>> Using analysis name from \$ANALYSIS_NAME: ${analysis_name}"
+else
+  echo ">>> Defaulting analysis name to ${analysis_name}"
+fi
+
 # --- Run the low-storage wrapper
 python pipeline_wrapper_low_storage.py \
   --subjects 1-27 \
   --glove-path "$GLOVE" \
+  --analysis-name "$analysis_name" \
   --continue-on-error \
-  --keep-reports
+  --keep-reports \
+  "$@"

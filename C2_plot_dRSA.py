@@ -2,11 +2,18 @@ import argparse
 import json
 import os
 import textwrap
+from pathlib import Path
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 from functions.core_functions import compute_lag_correlation
+from functions.generic_helpers import (
+    find_latest_analysis_directory,
+    normalise_analysis_name,
+    read_repository_root,
+)
 
 
 def bootstrap_mean_ci(data, n_bootstraps=1000, confidence=0.95, random_state=None):
@@ -41,6 +48,35 @@ def generate_plots(
     lag_bootstrap_settings,
     plot_path,
 ):
+    """Render per-neural dRSA figures combining RSA matrices and lag curves.
+
+    Parameters
+    ----------
+    rsa_matrices : array-like
+        Nested array shaped (n_neural, n_models, n_tp, n_tp) containing the
+        averaged dRSA matrices for every neural/model pair.
+    lag_curves_array : array-like or None
+        Optional bootstrap samples of lag correlation curves with shape
+        (n_neural, n_models, n_iterations, n_lags). When provided, confidence
+        intervals are computed per curve.
+    model_labels : Sequence[str]
+        Ordered labels identifying the computational models.
+    neural_labels : Sequence[str]
+        Ordered labels describing each neural signal or ROI analysed.
+    analysis_parameters : Mapping[str, Any]
+        Dictionary persisted by ``C1_dRSA_run.py`` containing analysis metadata
+        such as the averaging window (tps) and sampling resolution (Hz).
+    lag_bootstrap_settings : Mapping[str, Any]
+        Settings used to resample lag curves (iterations, confidence, seed).
+    plot_path : str or Path
+        Base output path. When multiple neural signals are present, the label is
+        appended to the filename before saving.
+
+    Returns
+    -------
+    List[str]
+        File paths for every generated figure (one entry per neural label).
+    """
     adtw_in_tps = analysis_parameters["averaging_window_tps"]
     resolution = analysis_parameters["resolution_hz"]
 
@@ -230,9 +266,23 @@ def main():
         help="Explicit analysis run id. Overrides subject/resolution/rsa-method options.",
     )
     parser.add_argument(
+        "--analysis-name",
+        help=(
+            "Named analysis folder under --results-root. "
+            "When omitted, the most recent analysis is selected automatically."
+        ),
+    )
+    parser.add_argument(
+        "--results-root",
+        type=Path,
+        default=Path("results"),
+        help="Parent directory containing analysis runs (default: results/).",
+    )
+    parser.add_argument(
         "--results-dir",
-        default="results",
-        help="Directory containing cached dRSA outputs (default: results).",
+        type=Path,
+        default=None,
+        help="Legacy override pointing directly to cached dRSA outputs.",
     )
     args = parser.parse_args()
 
@@ -240,6 +290,8 @@ def main():
         subject_label = args.subject
     else:
         subject_label = f"sub-{int(args.subject):02d}"
+
+    repo_root = read_repository_root()
 
     if args.analysis_id:
         analysis_run_id = args.analysis_id
@@ -250,39 +302,80 @@ def main():
             args.rsa_method,
         )
 
-    results_dir = args.results_dir
-    metadata_path = os.path.join(results_dir, f"{analysis_run_id}_metadata.json")
-    if not os.path.exists(metadata_path):
+    analysis_root: Optional[Path] = None
+    analysis_name = args.analysis_name
+
+    if args.results_dir is not None:
+        results_dir = Path(args.results_dir)
+        if not results_dir.is_absolute():
+            results_dir = (repo_root / results_dir).resolve()
+        else:
+            results_dir = results_dir.resolve()
+        print(f"Using legacy results directory: {results_dir}")
+    else:
+        results_root = args.results_root
+        if not results_root.is_absolute():
+            results_root = (repo_root / results_root).resolve()
+        else:
+            results_root = results_root.resolve()
+        if analysis_name:
+            normalised_name = normalise_analysis_name(analysis_name)
+            analysis_root = (results_root / normalised_name).resolve()
+        else:
+            latest_root = find_latest_analysis_directory(results_root)
+            if latest_root is None:
+                raise FileNotFoundError(
+                    f"No analysis directories found under {results_root}. "
+                    "Run C1_dRSA_run.py first or provide --analysis-name/--results-dir."
+                )
+            analysis_root = latest_root
+            normalised_name = latest_root.name
+        if not analysis_root.exists():
+            raise FileNotFoundError(
+                f"Analysis directory {analysis_root} does not exist. "
+                "Ensure C1_dRSA_run.py has finished or adjust --analysis-name."
+            )
+        analysis_name = normalised_name
+        results_dir = (analysis_root / "single_subjects").resolve()
+        print(f"Analysis: {analysis_name} ({analysis_root})")
+        print(f"Reading subject outputs from {results_dir}")
+
+    if not results_dir.exists():
+        raise FileNotFoundError(f"Results directory {results_dir} does not exist.")
+
+    metadata_path = results_dir / f"{analysis_run_id}_metadata.json"
+    if not metadata_path.exists():
         raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
 
-    with open(metadata_path, "r") as f:
+    with metadata_path.open("r") as f:
         metadata = json.load(f)
 
     outputs = metadata.get("outputs", {})
-    rsa_matrices_path = outputs.get("rsa_matrices") or os.path.join(
-        results_dir, f"{analysis_run_id}_dRSA_matrices.npy"
-    )
-    if not os.path.exists(rsa_matrices_path):
+    rsa_matrices_path = outputs.get("rsa_matrices")
+    if rsa_matrices_path:
+        rsa_matrices_path = Path(rsa_matrices_path)
+    else:
+        rsa_matrices_path = results_dir / f"{analysis_run_id}_dRSA_matrices.npy"
+    if not rsa_matrices_path.exists():
         raise FileNotFoundError(f"RSA matrices file not found: {rsa_matrices_path}")
     rsa_matrices = np.load(rsa_matrices_path)
 
     lag_curves_path = outputs.get("lag_curves")
     lag_curves_array = None
-    if lag_curves_path and os.path.exists(lag_curves_path):
-        lag_curves_array = np.load(lag_curves_path)
-    else:
-        if lag_curves_path:
-            print(
-                f"! lag curves file referenced in metadata but missing: {lag_curves_path}"
-            )
+    if lag_curves_path:
+        lag_curves_path = Path(lag_curves_path)
+        if lag_curves_path.exists():
+            lag_curves_array = np.load(lag_curves_path)
         else:
-            print("! lag curves not available; plotting without confidence intervals.")
+            print(f"! lag curves file referenced in metadata but missing: {lag_curves_path}")
+    else:
+        print("! lag curves not available; plotting without confidence intervals.")
 
-    plot_path = (
-        outputs.get("plot_target")
-        or outputs.get("plot")
-        or os.path.join(results_dir, f"{analysis_run_id}_plot.png")
-    )
+    plot_path = outputs.get("plot_target") or outputs.get("plot")
+    if plot_path:
+        plot_path = Path(plot_path)
+    else:
+        plot_path = results_dir / f"{analysis_run_id}_plot.png"
 
     model_labels = metadata["selected_model_labels"]
     neural_labels = metadata["neural_signal_labels"]
@@ -296,7 +389,7 @@ def main():
         neural_labels,
         analysis_parameters,
         lag_bootstrap_settings,
-        plot_path,
+        str(plot_path),
     )
     if len(saved_paths) == 1:
         print(f"✓ Saved dRSA plot to {saved_paths[0]}")
