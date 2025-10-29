@@ -1,17 +1,43 @@
+import argparse
+import hashlib
 import json
 import os
-import sys
-import hashlib
+from pathlib import Path
 
-import numpy as np
 import mne
+import numpy as np
 from functions.core_functions import (
     subsampling,
     compute_rsa_matrix_corr,
     compute_rdm_series_from_indices,
+    save_subsample_diagnostics,
 )
 from functions.PCR_alpha import compute_rsa_matrix_PCR
-from functions.generic_helpers import read_repository_root
+from functions.generic_helpers import ensure_analysis_directories, read_repository_root
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run subject-level dRSA analysis and store outputs in a structured results folder."
+    )
+    parser.add_argument(
+        "subject",
+        help="Subject identifier (e.g., 'sub-01' or '1').",
+    )
+    parser.add_argument(
+        "--analysis-name",
+        help=(
+            "Custom analysis folder name. When omitted, a timestamped name such as "
+            "'20240130_143210' is generated automatically."
+        ),
+    )
+    parser.add_argument(
+        "--results-root",
+        type=Path,
+        default=Path("results"),
+        help="Parent directory that will contain the analysis folder (default: results/).",
+    )
+    return parser.parse_args(argv)
 
 
 def compute_mask_signature(mask_array):
@@ -21,12 +47,26 @@ def compute_mask_signature(mask_array):
     packed = np.packbits(mask_bool)
     return hashlib.sha1(packed.tobytes()).hexdigest()
 
-# repository root
+# CLI + repository root
+args = parse_args()
 repo_root = read_repository_root()
+
+if args.results_root.is_absolute():
+    resolved_results_root = args.results_root
+else:
+    resolved_results_root = (repo_root / args.results_root).resolve()
+analysis_name, analysis_root, single_subjects_dir, group_level_dir = ensure_analysis_directories(
+    resolved_results_root, args.analysis_name
+)
+results_root = analysis_root.parent
+
+print(f"Analysis name: {analysis_name}")
+print(f"Analysis directory: {analysis_root}")
+print(f"Subject-level outputs will be written to: {single_subjects_dir}")
 
 # ===== load data =====
 # paths
-subject_arg = sys.argv[1]
+subject_arg = args.subject
 if subject_arg.startswith("sub-"):
     subject_label = subject_arg
     subject = int(subject_arg.split("-")[1])
@@ -141,6 +181,16 @@ voicing_path_candidates = [
 ]
 voicing_path = next((path for path in voicing_path_candidates if os.path.exists(path)), None)
 
+word_onsets_path = Path(
+    repo_root,
+    "derivatives",
+    "preprocessed",
+    subject_label,
+    "concatenated",
+    f"{subject_label}_concatenated_word_onsets_sec.npy",
+)
+if not word_onsets_path.exists():
+    word_onsets_path = None
 
 MEG_path = os.path.join(
     repo_root,
@@ -282,17 +332,17 @@ analysis_parameters = {
     "subsampling_random_state": subsampling_random_state,
 }
 
-results_dir = "results"
-os.makedirs(results_dir, exist_ok=True)
 analysis_run_id = f"{subject_label}_res{resolution}_{rsa_computation_method}"
-rsa_matrices_path = os.path.join(results_dir, f"{analysis_run_id}_dRSA_matrices.npy")
-metadata_path = os.path.join(results_dir, f"{analysis_run_id}_metadata.json")
-plot_path = os.path.join(results_dir, f"{analysis_run_id}_plot.png")
-lag_curves_path = os.path.join(results_dir, f"{analysis_run_id}_lag_curves.npy")
+subject_results_dir = single_subjects_dir
+rsa_matrices_path = subject_results_dir / f"{analysis_run_id}_dRSA_matrices.npy"
+metadata_path = subject_results_dir / f"{analysis_run_id}_metadata.json"
+plot_path = subject_results_dir / f"{analysis_run_id}_plot.png"
+lag_curves_path = subject_results_dir / f"{analysis_run_id}_lag_curves.npy"
 
-cache_root = os.path.join(results_dir, "cache")
-subsample_cache_dir = os.path.join(cache_root, "subsamples")
-os.makedirs(subsample_cache_dir, exist_ok=True)
+cache_root = subject_results_dir / "cache"
+subsample_cache_dir = cache_root / "subsamples"
+cache_root.mkdir(parents=True, exist_ok=True)
+subsample_cache_dir.mkdir(parents=True, exist_ok=True)
 
 mask_signature = compute_mask_signature(mask)
 subsample_cache_key = json.dumps(
@@ -307,13 +357,14 @@ subsample_cache_key = json.dumps(
     sort_keys=True,
 )
 subsample_cache_name = hashlib.sha1(subsample_cache_key.encode("utf-8")).hexdigest()
-subsample_cache_path = os.path.join(subsample_cache_dir, f"subsamples_{subsample_cache_name}.npy")
+subsample_cache_path = subsample_cache_dir / f"subsamples_{subsample_cache_name}.npy"
 
 # ===== run dRSA =====
 
-if os.path.exists(subsample_cache_path):
+if subsample_cache_path.exists():
     subsample_indices = np.load(subsample_cache_path)
     print(f"\u2713 loaded cached subsample indices ({subsample_cache_name})")
+    diagnostics_needed = not subsample_cache_path.with_suffix(".png").exists()
 else:
     subsample_indices = subsampling(
         tps,
@@ -323,9 +374,22 @@ else:
         mask=mask,
         random_state=subsampling_random_state,
     )
-    os.makedirs(cache_root, exist_ok=True)
     np.save(subsample_cache_path, subsample_indices, allow_pickle=False)
     print(f"\u2713 subsample indices (cached id {subsample_cache_name})")
+    diagnostics_needed = True
+
+if diagnostics_needed:
+    try:
+        save_subsample_diagnostics(
+            subsample_indices=subsample_indices,
+            subsample_cache_path=subsample_cache_path,
+            mask_array=mask,
+            word_onsets_path=word_onsets_path,
+            sampling_rate=resolution,
+            zoom_window_seconds=(30.0, 45.0),
+        )
+    except Exception as exc:
+        print(f"Warning: failed to create subsample diagnostic plot: {exc}")
 
 rsa_accumulators = np.zeros(
     (len(neural_signal_sets), len(selected_models), subsample_tps, subsample_tps),
@@ -410,6 +474,8 @@ lag_bootstrap_settings = {
     "random_state": lag_bootstrap_random_state,
 }
 
+plot_exists = plot_path.exists()
+
 analysis_metadata = {
     "subject": subject,
     "subject_label": subject_label,
@@ -429,21 +495,34 @@ analysis_metadata = {
     "lag_bootstrap_settings": lag_bootstrap_settings,
     "selected_model_labels": selected_models_labels,
     "neural_signal_labels": neural_signal_labels,
+    "analysis_name": analysis_name,
+    "analysis_paths": {
+        "results_root": str(results_root),
+        "analysis_root": str(analysis_root),
+        "single_subjects": str(single_subjects_dir),
+        "group_level": str(group_level_dir),
+        "subject_results_dir": str(subject_results_dir),
+    },
     "subsample_cache": {
         "id": subsample_cache_name,
-        "path": subsample_cache_path,
+        "path": str(subsample_cache_path),
+        "plot": str(subsample_cache_path.with_suffix(".png")),
     },
     "rsa_matrix_shape": list(rsa_matrices.shape),
     "lag_curves_shape": (
         list(lag_curves_array.shape) if lag_curves_array is not None else None
     ),
     "outputs": {
-        "rsa_matrices": rsa_matrices_path if save_rsa_matrices else None,
+        "rsa_matrices": str(rsa_matrices_path) if save_rsa_matrices else None,
         "lag_curves": (
-            lag_curves_path if save_lag_curves and lag_curves_array is not None else None
+            str(lag_curves_path)
+            if save_lag_curves and lag_curves_array is not None
+            else None
         ),
-        "plot": None,
-        "plot_target": plot_path,
+        "plot": str(plot_path) if plot_exists else None,
+        "plot_target": str(plot_path),
+        "cache_root": str(cache_root),
+        "metadata": str(metadata_path),
     },
 }
 
