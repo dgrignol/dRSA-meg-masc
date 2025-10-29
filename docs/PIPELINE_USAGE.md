@@ -138,6 +138,7 @@ Runs the subject-level dynamic RSA analysis.
   - `sub-XX_res100_correlation_dRSA_matrices.npy`
   - `sub-XX_res100_correlation_metadata.json`
   - `sub-XX_res100_correlation_plot.png` (target path recorded in the metadata for C2)
+  - `cache/subsamples/subsamples_<HASH>.png` (QC plot showing global/zoomed subsample coverage saved next to the cached indices)
 - **Key options**
   - `subject` – positional subject label or integer.
   - `--analysis-name NAME` – recommended; names the analysis folder under `results/` (default: timestamp such as `20240130_143210`).
