@@ -24,6 +24,13 @@ export PYTHONNOUSERSITE=1
 python -V
 which python
 
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+
+extra_args=("$@")
+
 subject=$(printf "%02d" "$SGE_TASK_ID")
 python A1_preprocess_data.py \
-  --subjects "$subject"
+  --subjects "$subject" \
+  "${extra_args[@]}"

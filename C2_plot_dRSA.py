@@ -13,6 +13,7 @@ from functions.generic_helpers import (
     find_latest_analysis_directory,
     normalise_analysis_name,
     read_repository_root,
+    rebase_path_to_known_root,
 )
 
 
@@ -351,31 +352,53 @@ def main():
         metadata = json.load(f)
 
     outputs = metadata.get("outputs", {})
-    rsa_matrices_path = outputs.get("rsa_matrices")
-    if rsa_matrices_path:
-        rsa_matrices_path = Path(rsa_matrices_path)
-    else:
-        rsa_matrices_path = results_dir / f"{analysis_run_id}_dRSA_matrices.npy"
+
+    def resolve_output_path(
+        key: str, fallback_name: str, require_exists: bool = True
+    ) -> tuple[Path, list[Path]]:
+        stored_path = outputs.get(key)
+        attempts: list[Path] = []
+        if stored_path:
+            candidate = rebase_path_to_known_root(Path(stored_path))
+            if not candidate.is_absolute():
+                candidate = (results_dir / candidate).resolve()
+            attempts.append(candidate)
+            if not require_exists or candidate.exists():
+                return candidate, attempts
+        fallback_path = results_dir / Path(fallback_name)
+        attempts.append(fallback_path)
+        if not require_exists or fallback_path.exists():
+            return fallback_path, attempts
+        return fallback_path, attempts
+
+    rsa_default = f"{analysis_run_id}_dRSA_matrices.npy"
+    rsa_matrices_path, rsa_attempts = resolve_output_path("rsa_matrices", rsa_default)
     if not rsa_matrices_path.exists():
-        raise FileNotFoundError(f"RSA matrices file not found: {rsa_matrices_path}")
+        attempted = ", ".join(str(p) for p in rsa_attempts)
+        raise FileNotFoundError(
+            f"RSA matrices file not found after checking: {attempted}"
+        )
     rsa_matrices = np.load(rsa_matrices_path)
 
-    lag_curves_path = outputs.get("lag_curves")
+    lag_default = f"{analysis_run_id}_lag_curves.npy"
+    lag_curves_path, lag_attempts = resolve_output_path("lag_curves", lag_default)
     lag_curves_array = None
-    if lag_curves_path:
-        lag_curves_path = Path(lag_curves_path)
-        if lag_curves_path.exists():
-            lag_curves_array = np.load(lag_curves_path)
+    if lag_curves_path.exists():
+        lag_curves_array = np.load(lag_curves_path)
+    else:
+        if outputs.get("lag_curves"):
+            attempted = ", ".join(str(p) for p in lag_attempts)
+            print(f"! lag curves file referenced in metadata but missing: {attempted}")
         else:
-            print(f"! lag curves file referenced in metadata but missing: {lag_curves_path}")
-    else:
-        print("! lag curves not available; plotting without confidence intervals.")
+            print("! lag curves not available; plotting without confidence intervals.")
 
-    plot_path = outputs.get("plot_target") or outputs.get("plot")
-    if plot_path:
-        plot_path = Path(plot_path)
+    plot_default = f"{analysis_run_id}_plot.png"
+    if outputs.get("plot_target"):
+        plot_path, _ = resolve_output_path("plot_target", plot_default, require_exists=False)
+    elif outputs.get("plot"):
+        plot_path, _ = resolve_output_path("plot", plot_default, require_exists=False)
     else:
-        plot_path = results_dir / f"{analysis_run_id}_plot.png"
+        plot_path = results_dir / plot_default
 
     model_labels = metadata["selected_model_labels"]
     neural_labels = metadata["neural_signal_labels"]

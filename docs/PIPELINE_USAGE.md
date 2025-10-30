@@ -1,18 +1,12 @@
-# MEG-MASC Analysis Pipeline Guide
+# MEG-MASC dRSA Analysis Pipeline Guide
 
-This document summarises how to run the MEG-MASC processing scripts shipped with the repository, how to combine them with the provided pipeline wrappers, and how to submit the full workflow to an SGE cluster. Every command below assumes you execute it from the repository root with the desired Python environment activated (e.g. `source .venv/bin/activate`). All scripts expose `--help`; consult it for the definitive option list.
+This document summarises how to run the MEG-MASC processing scripts (from preprocessing to dRSA), how to combine them with the pipeline wrappers, and how to submit the full workflow to an SGE cluster. Every command below assumes you execute it from the repository root with the desired Python environment activated (e.g. `source .venv/bin/activate`). All scripts expose `--help`; consult it for the definitive option list.
 
 ---
 
 ## 1. Prerequisites
 
-- **Python environment** – install dependencies with `pip install -r requirements.txt`. Most scripts rely on `mne`, `numpy`, `scipy`, `matplotlib`, and a handful of audio/text libraries.
-Locally you can use: 
-`cd /Volumes/MORWUR/Projects/DAMIANO/SpeDiction/meg-masc`
-`PYTHONPATH=".venv/lib/python3.13/site-packages"`
-Then run your script e.g. `python D1_group_cluster_analysis.py --subjects $(seq -w 1 2)` etc...
-On the cluster, you activate the micromamba env: `micromamba activate drsa311   # or whichever env has Python 3`
-Then run your script.
+- **Python environment** – install dependencies with `pip install -r requirements.txt`. Most scripts rely on `mne`, `numpy`, `scipy`, `matplotlib`, and a handful of audio/text libraries. Activate the local virtual environment (`source .venv/bin/activate`) before running any script, or call its interpreter explicitly (e.g. `./.venv/bin/python D1_group_cluster_analysis.py --subjects $(seq -w 1 2)`). No manual `PYTHONPATH` tweaks are required. On the cluster, activate the micromamba env: `micromamba activate drsa311  # or whichever env has Python 3`, then run your script.
 - **Data layout** – the anonymised BIDS dataset must live in `bids_anonym/`. All derivatives are created inside `derivatives/`, and dRSA outputs are stored in named subfolders under `results/<analysis_name>/` (`single_subjects/` and `group_level/`).
 - **GloVe embeddings** – scripts that touch word embeddings (B4 and the wrappers) require a plain-text GloVe file (e.g. `glove.6B.300d.txt`). Store its path in `glove_path.txt`, set `$GLOVE_PATH`, or pass `--glove-path`.
 
@@ -138,11 +132,13 @@ Runs the subject-level dynamic RSA analysis.
   - `sub-XX_res100_correlation_dRSA_matrices.npy`
   - `sub-XX_res100_correlation_metadata.json`
   - `sub-XX_res100_correlation_plot.png` (target path recorded in the metadata for C2)
-  - `cache/subsamples/subsamples_<HASH>.png` (QC plot showing global/zoomed subsample coverage saved next to the cached indices)
+  - `cache/subsamples/subsamples_<HASH>.png` (QC plot saved with the cached indices; word onsets appear as red overlays when available)
 - **Key options**
   - `subject` – positional subject label or integer.
   - `--analysis-name NAME` – recommended; names the analysis folder under `results/` (default: timestamp such as `20240130_143210`).
   - `--results-root PATH` – parent directory that will contain the analysis folder (default: `results`).
+  - `--lock-subsample-to-word-onset` – restrict subsample starts to the concatenated word onset timestamps (requires the numpy file written by A2).
+  - `--allow-overlap` – allow subsample windows to overlap (handy when the onset density is low; compatible with and without locking).
 - **Usage**
   ```bash
   # Preferred: explicit analysis name reused across scripts
@@ -151,6 +147,7 @@ Runs the subject-level dynamic RSA analysis.
   # Quick run: auto-generate a timestamped folder under results/
   python C1_dRSA_run.py 03
   ```
+- **Word onset workflows**: When `derivatives/preprocessed/<subject>/concatenated/<subject>_concatenated_word_onsets_sec.npy` exists, C1 hashes the timestamps for caching, records their provenance inside the metadata JSON, and overlays them on the subsampling QC figure. Passing `--lock-subsample-to-word-onset` enforces that every subsample starts at a word onset (after trimming windows that would overrun the recording). Toggling either `--lock-subsample-to-word-onset` or `--allow-overlap` automatically invalidates the subsample cache so reruns remain reproducible.
 - **Tuning**: Edit the constants near the bottom of the file (e.g., `averaging_diagonal_time_window_sec`, `n_subsamples`) to adjust the analysis.
 
 ### C2_plot_dRSA.py
@@ -219,6 +216,7 @@ Runs every step (A1→D1) for the chosen subjects without deleting intermediates
   - `--continue-on-error` – keep running even if a step fails.
   - `--group-subjects` – override the subject list passed to D1.
   - `--analysis-name NAME` – recommended; names the results folder reused by C1/D1 (default: timestamp).
+  - `--lock-subsample-to-word-onset`, `--allow-overlap` – forward the subsampling controls to C1 when set.
   - `--results-root PATH`, `--lag-metric`, `--models`, `--d1-output`, `--d1-n-permutations`.
   - `--log-level`.
 - **Examples**
@@ -245,6 +243,7 @@ Processes subjects one at a time, pruning bulky intermediates after C1 (native-r
   - `--keep-derivatives` – skip cleanup for debugging.
   - `--keep-reports` – keep HTML/PDF reports while still removing large arrays.
   - `--analysis-name NAME` – recommended; ensures every subject writes into the same results folder (default: timestamp).
+  - `--lock-subsample-to-word-onset`, `--allow-overlap` – forward onset locking/overlap flags to C1 before pruning intermediates.
   - `--results-root`, `--models`, `--lag-metric`, `--d1-output`, `--d1-n-permutations`, `--log-level`.
 - **Examples**
   ```bash
@@ -337,6 +336,7 @@ qsub s2_submit_C1_subject.sh                         # run subjects 01–27 (def
 qsub -t 2 s2_submit_C1_subject.sh                    # only subject 02
 qsub -t 5-9 s2_submit_C1_subject.sh -- --analysis-name lexical_mem_2024   # explicit folder
 qsub s2_submit_C1_subject.sh -- --lock-subsample-to-word-onset --allow-overlap # extra flags
+qsub s2_submit_C1_subject.sh -- --analysis-name lock_to_onset_overlap --lock-subsample-to-word-onset --allow-overlap
 ```
 
 Logs land in `logs/C1_dRSA.<jobid>.<taskid>.{out,err}`. When passing optional flags remember to include the separator if you supply additional `qsub` options:
