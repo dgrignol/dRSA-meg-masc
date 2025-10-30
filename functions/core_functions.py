@@ -475,7 +475,9 @@ def save_subsample_diagnostics(
             word_onsets = np.load(onset_path)
 
     sampling_rate = float(sampling_rate)
+    dt = 1.0 / sampling_rate
     total_duration = (time_support - 1) / sampling_rate if time_support > 1 else 0.0
+    global_times = np.arange(time_support) / sampling_rate
 
     if zoom_window_seconds is None:
         earliest_start = starts.min() if starts.size else 0
@@ -508,7 +510,33 @@ def save_subsample_diagnostics(
     else:
         onsets_in_window = np.empty(0, dtype=float)
 
-    dt = 1.0 / sampling_rate
+    def _shade_mask_regions(ax, times, mask, label=None):
+        if mask is None:
+            return
+        mask = np.asarray(mask, dtype=bool)
+        if mask.size == 0 or not mask.any():
+            return
+        sample_count = min(times.size, mask.size)
+        times = times[:sample_count]
+        mask = mask[:sample_count]
+        diffs = np.diff(np.concatenate(([False], mask, [False])))
+        starts_idx = np.where(diffs == 1)[0]
+        ends_idx = np.where(diffs == -1)[0]
+        for idx, (s_idx, e_idx) in enumerate(zip(starts_idx, ends_idx)):
+            start_t = times[s_idx]
+            end_idx = min(e_idx, sample_count)
+            end_t = times[end_idx - 1] + dt
+            ax.axvspan(
+                start_t,
+                end_t,
+                color="gold",
+                alpha=0.12,
+                edgecolor=None,
+                linewidth=0,
+                zorder=3,
+                label=label if label and idx == 0 else None,
+            )
+
     fig = plt.figure(figsize=(16, 12))
     gs = fig.add_gridspec(
         6,
@@ -533,6 +561,10 @@ def save_subsample_diagnostics(
     axA.set_title("A. Subsample overlap across all iterations")
     axA.set_xlim(0, total_duration)
     axA.set_xticklabels([])
+    _shade_mask_regions(axA, global_times, mask_bool, label="Sentence mask")
+    handlesA, labelsA = axA.get_legend_handles_labels()
+    if handlesA:
+        axA.legend(handlesA, labelsA, loc="upper right", frameon=False)
     cbarA = fig.colorbar(imA, cax=fig.add_subplot(gs[0, 1]), label="Overlap count", boundaries=bounds)
     cbarA.locator = ticker.FixedLocator(range(0, max_overlap + 1))
     cbarA.formatter = ticker.FixedFormatter(range(0, max_overlap + 1))
@@ -554,26 +586,6 @@ def save_subsample_diagnostics(
 
     fig.add_subplot(gs[2, :]).axis("off")
 
-    def shade_mask(ax, times, mask, label=None):
-        if mask is None or not mask.any():
-            return
-        mask_int = mask.astype(int)
-        diffs = np.diff(np.concatenate(([0], mask_int, [0])))
-        starts_idx = np.where(diffs == 1)[0]
-        ends_idx = np.where(diffs == -1)[0]
-        for i, (s_idx, e_idx) in enumerate(zip(starts_idx, ends_idx)):
-            start_t = times[s_idx]
-            end_idx = min(e_idx, len(times))
-            end_t = times[end_idx - 1] + dt
-            ax.axvspan(
-                start_t,
-                end_t,
-                color="gold",
-                alpha=0.12,
-                edgecolor=None,
-                label=label if label and i == 0 else None,
-            )
-
     # Panel C
     axC = fig.add_subplot(gs[3, 0])
     imC = axC.imshow(
@@ -587,7 +599,7 @@ def save_subsample_diagnostics(
     axC.set_ylabel("Iteration")
     axC.set_title("C. Zoomed subsample windows")
     axC.set_ylim(iterations, 0)
-    shade_mask(axC, zoom_seconds, mask_slice, label="Sentence mask")
+    _shade_mask_regions(axC, zoom_seconds, mask_slice, label="Sentence mask")
     for idx_onset, onset in enumerate(onsets_in_window):
         axC.axvline(onset, color="crimson", linewidth=0.6, alpha=0.7, label="Word onsets" if idx_onset == 0 else None)
     handles, labels = axC.get_legend_handles_labels()
@@ -603,7 +615,7 @@ def save_subsample_diagnostics(
     # Panel D
     axD = fig.add_subplot(gs[4, 0], sharex=axC)
     axD.plot(zoom_seconds, sub_coverage, color="slateblue", linewidth=0.9, label="Coverage")
-    shade_mask(axD, zoom_seconds, mask_slice, label="Sentence mask")
+    _shade_mask_regions(axD, zoom_seconds, mask_slice, label="Sentence mask")
     if onsets_in_window.size:
         axD.vlines(
             onsets_in_window,

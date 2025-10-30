@@ -376,4 +376,110 @@ Logs from the cluster run are written to `logs/<jobname>.<jobid>.{out,err}` as c
 - The wrappers propagate failures—check the `results/` directory after a run to verify that every subject produced both the matrix (`*_dRSA_matrices.npy`) and metadata files.
 - For ad-hoc experimentation, run individual scripts with `--help` to see defaults and optional features not covered above.
 
+---
+
+## Summary Workflow (A1 → D1)
+
+Use this checklist to drive the entire pipeline with consistent analysis folders. Commands are shown for direct execution and, when available, the corresponding SGE helpers. Replace subject lists, model choices, and paths to suit your experiment.
+
+1. **Initial setup**
+   - Direct:  
+     ```bash
+     cd /mnt/storage/tier2/morwur/Projects/DAMIANO/SpeDiction/meg-masc
+     export ANALYSIS_NAME=lexical_mem_fullrun_$(date +%Y%m%d_%H%M%S)
+     ```
+   - SGE note: propagate the variable with `qsub -v ANALYSIS_NAME="$ANALYSIS_NAME" …` (or add `#$ -v ANALYSIS_NAME` to the script header). SGE does not support a `-ANALYSIS_NAME` flag.
+
+2. **A1 – Preprocess raw MEG runs**
+   - Direct: `python A1_preprocess_data.py --subjects 01 02 --overwrite`
+   - Output: `derivatives/preprocessed/sub-XX/ses-*/task-*/…`
+   - SGE: `qsub -v ANALYSIS_NAME="$ANALYSIS_NAME" -t 1-27 s2_submit_A1_preproc.sh -- --overwrite`
+
+3. **A2 – Concatenate derivatives**
+   - Direct: `python A2_concatenate_subject_data.py --subject sub-01 --overwrite`
+   - Output: `derivatives/preprocessed/sub-XX/concatenated/*_concatenated_*`
+   - SGE: `qsub -v ANALYSIS_NAME="$ANALYSIS_NAME" -t 1-27 s2_submit_A2_concat.sh -- --overwrite`
+
+4. **A3 – Resample concatenates (100 Hz)**
+   - Direct: `python A3_resample_concatenated_data.py --subject sub-01 --target-rate 100 --overwrite`
+   - Output: 100 Hz MEG/mask arrays in the concatenated directory
+   - SGE: `qsub -v ANALYSIS_NAME="$ANALYSIS_NAME" -t 1-27 s2_submit_A3_resample.sh -- --target-rate 100 --overwrite`
+
+5. **B1 – Speech envelopes**
+   - Direct: `python B1_model_envelope.py --subjects 01 02 --target-rate 100 --overwrite`
+   - Output: `derivatives/Models/envelope/sub-XX/...`
+
+6. **B2 – Word frequency trajectories**
+   - Direct: `python B2_wordfreq.py --subjects 01 02 --target-rate 100 --overwrite`
+   - Output: `derivatives/Models/wordfreq/sub-XX/...`
+
+7. **B3 – Phoneme voicing**
+   - Direct: `python B3_voicing.py --subjects 01 02 --target-rate 100 --overwrite`
+   - Output: `derivatives/Models/voicing/sub-XX/...`
+
+8. **B4 – GloVe embeddings**
+   - Direct:  
+     ```bash
+     python B4_glove.py \
+       --subjects 01 02 \
+       --glove-path /path/to/glove.6B.300d.txt \
+       --target-rate 100 \
+       --overwrite
+     ```
+   - Output: `derivatives/Models/glove/sub-XX/...` (100 Hz arrays and norms)
+
+9. **C1 – Subject-level dRSA**
+   - Direct: `python C1_dRSA_run.py sub-01 --analysis-name "$ANALYSIS_NAME"`
+   - Output: `results/$ANALYSIS_NAME/single_subjects/*` (matrices, metadata, caches, plots)
+   - SGE:  
+     ```bash
+     qsub -v ANALYSIS_NAME="$ANALYSIS_NAME" \
+          -t 1-27 \
+          s2_submit_C1_subject.sh \
+          -- --analysis-name "$ANALYSIS_NAME" --lock-subsample-to-word-onset --allow-overlap
+      
+      qsub -v ANALYSIS_NAME=first_correlation_nolock_nooverlap \ # pass directly the analysis name
+          -t 1 \
+          s2_submit_C1_subject.sh
+     ```
+
+10. **C2 – Subject plots**
+    - Direct: `python C2_plot_dRSA.py sub-01 --analysis-name "$ANALYSIS_NAME"`
+    - Output: refreshed PNG plots in `results/$ANALYSIS_NAME/single_subjects/`
+    - SGE: `qsub -v ANALYSIS_NAME="$ANALYSIS_NAME" -t 1-27 s2_submit_C2_plot.sh -- --analysis-name "$ANALYSIS_NAME"`
+
+11. **D1 – Group cluster analysis**
+    - Direct:  
+      ```bash
+      python D1_group_cluster_analysis.py \
+        --analysis-name "$ANALYSIS_NAME" \
+        --subjects $(seq -w 1 27) \
+        --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm"
+      ```
+    - Output: `results/$ANALYSIS_NAME/group_level/*` (PNG, PDF, NPZ)
+    - SGE: `qsub -v ANALYSIS_NAME="$ANALYSIS_NAME" s2_submit_D1_group.sh -- --subjects $(seq -w 1 27)`
+
+12. **Wrapper alternatives (optional)**
+    - Direct (full pipeline):  
+      ```bash
+      python pipeline_wrapper.py \
+        --subjects 01 02 \
+        --glove-path /path/to/glove.6B.300d.txt \
+        --analysis-name "$ANALYSIS_NAME" \
+        --overwrite
+      ```
+    - Direct (low storage):  
+      ```bash
+      python pipeline_wrapper_low_storage.py \
+        --subjects 01 02 \
+        --glove-path /path/to/glove.6B.300d.txt \
+        --analysis-name "$ANALYSIS_NAME" \
+        --continue-on-error
+      ```
+    - SGE:  
+      - `qsub -v ANALYSIS_NAME="$ANALYSIS_NAME" s2_submit_python_wrapper.sh -- --subjects 01 02 --glove-path /path/to/glove.6B.300d.txt --analysis-name "$ANALYSIS_NAME" --overwrite`  
+      - `qsub -v ANALYSIS_NAME="$ANALYSIS_NAME" s2_submit_python_wrapper_low_storage.sh -- --subjects 01-27 --glove-path /path/to/glove.6B.300d.txt --analysis-name "$ANALYSIS_NAME" --continue-on-error --keep-reports`
+
+When launching any qsub job, always forward the analysis name with `-v ANALYSIS_NAME=…` so every node writes into the same `results/<analysis_name>/` tree.
+
 Happy analysing!
