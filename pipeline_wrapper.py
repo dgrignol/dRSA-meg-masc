@@ -35,7 +35,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
-from functions.generic_helpers import read_repository_root
+from functions.generic_helpers import (
+    ensure_analysis_directories,
+    generate_timestamped_analysis_name,
+    read_repository_root,
+)
 
 
 LOGGER = logging.getLogger("pipeline_wrapper")
@@ -65,13 +69,25 @@ class PipelineContext:
     continue_on_error: bool
     glove_path: Optional[Path]
     group_subject_tokens: Optional[List[str]]
-    results_dir: Path
+    results_root: Path
+    analysis_name: str
+    analysis_root: Path
+    single_subjects_dir: Path
+    group_level_dir: Path
     lag_metric: str
     models: List[str]
     d1_output: Optional[Path]
     d1_n_permutations: Optional[int]
+    lock_subsample_to_word_onset: bool
+    allow_overlap: bool
 
     _cached_group_subjects: Optional[List[str]] = None
+
+    @property
+    def results_dir(self) -> Path:
+        """Backward-compatible alias for the single-subject results directory."""
+
+        return self.single_subjects_dir
 
     @property
     def subject_labels(self) -> List[str]:
@@ -84,7 +100,7 @@ class PipelineContext:
             subjects = parse_subject_tokens(self.group_subject_tokens)
         else:
             subjects = discover_group_subjects(
-                results_dir=self.results_dir,
+                results_dir=self.single_subjects_dir,
                 lag_metric=self.lag_metric,
             )
         self._cached_group_subjects = subjects
@@ -292,6 +308,16 @@ def step_c1(ctx: PipelineContext) -> List[CommandSpec]:
     commands: List[CommandSpec] = []
     for label in ctx.subject_labels:
         argv = [ctx.python_executable, "C1_dRSA_run.py", label]
+        argv.extend([
+            "--analysis-name",
+            ctx.analysis_name,
+            "--results-root",
+            str(ctx.results_root),
+        ])
+        if ctx.lock_subsample_to_word_onset:
+            argv.append("--lock-subsample-to-word-onset")
+        if ctx.allow_overlap:
+            argv.append("--allow-overlap")
         commands.append(CommandSpec(f"C1_dRSA[{label}]", argv))
     return commands
 
@@ -311,8 +337,10 @@ def step_d1(ctx: PipelineContext) -> List[CommandSpec]:
         *ctx.models,
         "--lag-metric",
         ctx.lag_metric,
-        "--results-dir",
-        str(ctx.results_dir),
+        "--analysis-name",
+        ctx.analysis_name,
+        "--results-root",
+        str(ctx.results_root),
     ]
     if ctx.d1_output is not None:
         argv.extend(["--output", str(ctx.d1_output)])
@@ -378,6 +406,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Forward the overwrite flag to steps that support it.",
     )
     parser.add_argument(
+        "--lock-subsample-to-word-onset",
+        action="store_true",
+        help="Lock C1 subsample starts to word onsets.",
+    )
+    parser.add_argument(
+        "--allow-overlap",
+        action="store_true",
+        help="Allow overlapping subsamples in C1.",
+    )
+    parser.add_argument(
         "--continue-on-error",
         action="store_true",
         help="Do not abort the pipeline when a step fails.",
@@ -389,9 +427,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "By default, the wrapper scans the results directory for available subjects.",
     )
     parser.add_argument(
+        "--analysis-name",
+        help=(
+            "Name of the analysis folder to create or reuse under --results-root."
+            " Defaults to a timestamp (recommended to provide one explicitly)."
+        ),
+    )
+    parser.add_argument(
+        "--results-root",
         "--results-dir",
+        dest="results_root",
         default="results",
-        help="Directory containing subject-level dRSA outputs for D1 (default: results).",
+        help="Parent directory containing analysis runs (default: results).",
     )
     parser.add_argument(
         "--lag-metric",
@@ -441,9 +488,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         LOGGER.info("No GloVe path resolved yet; will raise if B4_glove.py is reached.")
 
-    results_dir = Path(args.results_dir)
-    if not results_dir.is_absolute():
-        results_dir = (repo_root / results_dir).resolve()
+    results_root = Path(args.results_root)
+    if not results_root.is_absolute():
+        results_root = (repo_root / results_root).resolve()
+    else:
+        results_root = results_root.resolve()
+
+    requested_analysis_name = args.analysis_name
+    candidate_name = requested_analysis_name or generate_timestamped_analysis_name()
+    (
+        analysis_name,
+        analysis_root,
+        single_subjects_dir,
+        group_level_dir,
+    ) = ensure_analysis_directories(results_root, candidate_name)
+
+    if requested_analysis_name and analysis_name != requested_analysis_name:
+        LOGGER.info(
+            "Sanitised analysis name '%s' to '%s'.",
+            requested_analysis_name,
+            analysis_name,
+        )
+    LOGGER.info(
+        "Using analysis '%s' (subject outputs: %s, group outputs: %s)",
+        analysis_name,
+        single_subjects_dir,
+        group_level_dir,
+    )
 
     d1_output = Path(args.d1_output).resolve() if args.d1_output else None
 
@@ -455,11 +526,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         continue_on_error=args.continue_on_error,
         glove_path=glove_path,
         group_subject_tokens=args.group_subjects,
-        results_dir=results_dir,
+        results_root=results_root,
+        analysis_name=analysis_name,
+        analysis_root=analysis_root,
+        single_subjects_dir=single_subjects_dir,
+        group_level_dir=group_level_dir,
         lag_metric=args.lag_metric,
         models=args.models,
         d1_output=d1_output,
         d1_n_permutations=args.d1_n_permutations,
+        lock_subsample_to_word_onset=args.lock_subsample_to_word_onset,
+        allow_overlap=args.allow_overlap,
     )
 
     try:

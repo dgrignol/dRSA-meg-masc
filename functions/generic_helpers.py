@@ -1,6 +1,8 @@
 from functools import lru_cache
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+import re
+from typing import Optional, Union, Tuple
 
 
 def _iter_candidate_paths(pointer: Path):
@@ -111,3 +113,125 @@ def resolve_relative_path_casefold(base: Path, relative: Union[str, Path]) -> Op
         current = current / match
 
     return current
+
+
+_ANALYSIS_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+_ANALYSIS_TIMESTAMP_PATTERN = re.compile(r"^(\d{8})_(\d{6})(?:[._-].*)?$")
+
+
+def generate_timestamped_analysis_name(moment: Optional[datetime] = None) -> str:
+    """Return a default analysis name using ``YYYYMMDD_HHMMSS``."""
+
+    reference = moment or datetime.now()
+    return reference.strftime(_ANALYSIS_TIMESTAMP_FORMAT)
+
+
+def normalise_analysis_name(raw_name: str) -> str:
+    """
+    Sanitize ``raw_name`` so it can be safely used as a directory name.
+
+    The function replaces characters outside ``[A-Za-z0-9_-]`` with underscores,
+    collapses consecutive underscores, and strips leading/trailing separators.
+    ``ValueError`` is raised when the name becomes empty or resolves to a reserved
+    path fragment (``.`` or ``..``).
+    """
+
+    candidate = str(raw_name).strip()
+    if not candidate:
+        raise ValueError("Analysis name cannot be empty.")
+
+    candidate = candidate.replace("/", "_").replace("\\", "_")
+    candidate = re.sub(r"[^\w\-]+", "_", candidate)
+    candidate = re.sub(r"_+", "_", candidate)
+    candidate = candidate.strip("_.-")
+
+    if not candidate or candidate in {".", ".."}:
+        raise ValueError(
+            "Analysis name must contain at least one alphanumeric character after sanitisation."
+        )
+
+    return candidate
+
+
+def ensure_analysis_directories(
+    results_root: Path, analysis_name: Optional[str] = None
+) -> Tuple[str, Path, Path, Path]:
+    """
+    Create and return the directory layout for a dRSA analysis run.
+
+    Parameters
+    ----------
+    results_root:
+        Base directory under which the ``analysis_name`` folder resides.
+    analysis_name:
+        Optional user-specified name. When omitted, a timestamped default is used.
+
+    Returns
+    -------
+    Tuple[str, Path, Path, Path]
+        Normalised analysis name, analysis root, ``single_subjects`` path,
+        and ``group_level`` path.
+    """
+
+    results_root = Path(results_root).expanduser().resolve()
+    results_root.mkdir(parents=True, exist_ok=True)
+
+    if analysis_name:
+        resolved_name = normalise_analysis_name(analysis_name)
+    else:
+        resolved_name = generate_timestamped_analysis_name()
+
+    analysis_root = results_root / resolved_name
+    single_subjects_dir = analysis_root / "single_subjects"
+    group_level_dir = analysis_root / "group_level"
+
+    single_subjects_dir.mkdir(parents=True, exist_ok=True)
+    group_level_dir.mkdir(parents=True, exist_ok=True)
+
+    return resolved_name, analysis_root, single_subjects_dir, group_level_dir
+
+
+def find_latest_analysis_directory(results_root: Path) -> Optional[Path]:
+    """
+    Return the most recent analysis directory under ``results_root``.
+
+    Timestamp-style names (``YYYYMMDD_HHMMSS``) are prioritised and compared
+    lexicographically. When no timestamped folders are present, the directory
+    list falls back to modification time. ``None`` is returned if no candidates
+    exist or ``results_root`` is missing.
+    """
+
+    results_root = Path(results_root).expanduser().resolve()
+    if not results_root.exists():
+        return None
+
+    timestamped: list[tuple[datetime, Path]] = []
+    fallback: list[tuple[float, Path]] = []
+
+    for entry in results_root.iterdir():
+        if not entry.is_dir():
+            continue
+        match = _ANALYSIS_TIMESTAMP_PATTERN.fullmatch(entry.name)
+        if match:
+            timestamp_str = f"{match.group(1)}_{match.group(2)}"
+            try:
+                timestamp = datetime.strptime(timestamp_str, _ANALYSIS_TIMESTAMP_FORMAT)
+            except ValueError:
+                fallback.append((entry.stat().st_mtime, entry))
+            else:
+                timestamped.append((timestamp, entry))
+            continue
+
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        fallback.append((mtime, entry))
+
+    if timestamped:
+        timestamped.sort(key=lambda item: item[0], reverse=True)
+        return timestamped[0][1]
+    if fallback:
+        fallback.sort(key=lambda item: item[0], reverse=True)
+        return fallback[0][1]
+    return None

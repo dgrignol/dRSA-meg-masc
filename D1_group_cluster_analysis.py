@@ -7,20 +7,24 @@ tests whether the average lag-correlation curve shows significant clusters
 following Maris & Oostenveld (2007). It also visualises the average dRSA matrix
 for each model alongside the grand-average lag curve (with SEM shading), highlights
 significant clusters on the lag axis, and annotates their peak correlation/lag
-coordinates. Outputs are stored in ``results/group_level`` as both PNG and PDF,
-and a cached ``.npz`` bundle makes it possible to regenerate the figures without
-re-running the permutation test.
+coordinates. Outputs are stored in ``results/<analysis_name>/group_level`` as both PNG
+and PDF, and a cached ``.npz`` bundle makes it possible to regenerate the figures
+without re-running the permutation test.
 
-Expected per-subject files (per model):
-    results/sub-{ID}_res100_correlation_dRSA_matrices.npy
-    results/sub-{ID}_res100_correlation_metadata.json
+Expected per-subject files (per model) inside ``results/<analysis_name>/single_subjects``:
+    sub-{ID}_res100_correlation_dRSA_matrices.npy
+    sub-{ID}_res100_correlation_metadata.json
 
 Usage
 -----
 python D1_group_cluster_analysis.py \
     --subjects 01 02 03 \
-    --models Envelope "Word Frequency" "GloVe" "GloVe Norm" \
-    --output results/group_level/group_dRSA_summary.png
+    --models Envelope "Word Frequency" "GloVe" "GloVe Norm"
+
+python D1_group_cluster_analysis.py \
+    --analysis-name drsa_pilot \
+    --subjects $(seq -w 1 10) \
+    --models Envelope "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm"
 """
 
 from __future__ import annotations
@@ -36,7 +40,11 @@ import numpy as np
 from matplotlib import pyplot as plt
 from scipy.stats import ttest_rel, t
 
-from functions.generic_helpers import read_repository_root
+from functions.generic_helpers import (
+    ensure_analysis_directories,
+    find_latest_analysis_directory,
+    read_repository_root,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -57,10 +65,26 @@ def parse_args() -> argparse.Namespace:
         help="Ordered list of model labels to analyse (must match metadata labels).",
     )
     parser.add_argument(
-        "--results-dir",
+        "--analysis-name",
+        help=(
+            "Named analysis folder under --results-root. When omitted, the most recent analysis "
+            "is selected automatically."
+        ),
+    )
+    parser.add_argument(
+        "--results-root",
         type=Path,
         default=Path("results"),
-        help="Directory containing per-subject results (default: results).",
+        help="Parent directory containing analysis runs (default: results/).",
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Legacy override for the directory containing per-subject results when older layouts "
+            "are still in use."
+        ),
     )
     parser.add_argument(
         "--lag-metric",
@@ -89,8 +113,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("results") / "group_level" / "group_dRSA_summary.png",
-        help="Output path for the summary figure (PNG will be written here).",
+        default=None,
+        help=(
+            "Output path for the summary figure (PNG will be written here). "
+            "Defaults to <analysis>/group_level/group_dRSA_summary.png when using named analyses."
+        ),
     )
     parser.add_argument(
         "--summary-cache",
@@ -497,19 +524,69 @@ def main() -> int:
 
     # Resolve repository-relative paths so the script can run from any working directory.
     repo_root = read_repository_root()
-    results_dir = args.results_dir
-    if not results_dir.is_absolute():
-        results_dir = repo_root / results_dir
+
+    analysis_root: Optional[Path] = None
+    group_level_dir: Optional[Path] = None
+    results_dir_mode = "analysis"
+    analysis_name = args.analysis_name
+
+    if args.results_dir is not None:
+        results_dir = args.results_dir
+        if not results_dir.is_absolute():
+            results_dir = (repo_root / results_dir).resolve()
+        else:
+            results_dir = results_dir.resolve()
+        results_dir_mode = "legacy"
+        LOGGER.info("Using legacy results directory for subject inputs: %s", results_dir)
+    else:
+        results_root = args.results_root
+        if not results_root.is_absolute():
+            results_root = (repo_root / results_root).resolve()
+        else:
+            results_root = results_root.resolve()
+        if analysis_name:
+            (
+                analysis_name,
+                analysis_root,
+                single_subjects_dir,
+                group_level_dir,
+            ) = ensure_analysis_directories(results_root, analysis_name)
+        else:
+            latest_root = find_latest_analysis_directory(results_root)
+            if latest_root is None:
+                raise FileNotFoundError(
+                    f"No analysis directories found under {results_root}. "
+                    "Run C1_dRSA_run.py first or provide --analysis-name/--results-dir."
+                )
+            (
+                analysis_name,
+                analysis_root,
+                single_subjects_dir,
+                group_level_dir,
+            ) = ensure_analysis_directories(results_root, latest_root.name)
+        results_dir = single_subjects_dir
+        LOGGER.info("Using analysis '%s' located at %s.", analysis_name, analysis_root)
+        LOGGER.info("Subject-level inputs: %s", results_dir)
+        LOGGER.info("Group-level output directory: %s", group_level_dir)
+
+    if not results_dir.exists():
+        raise FileNotFoundError(f"Results directory {results_dir} does not exist.")
+
     output_path = args.output
+    if output_path is None:
+        if results_dir_mode == "analysis" and group_level_dir is not None:
+            output_path = group_level_dir / "group_dRSA_summary.png"
+        else:
+            output_path = Path("results") / "group_level" / "group_dRSA_summary.png"
     if not output_path.is_absolute():
-        output_path = repo_root / output_path
+        output_path = (repo_root / output_path).resolve()
     # Always emit a vector copy alongside the raster PNG for downstream figure editing.
     vector_output_path = output_path.with_suffix(".pdf")
     summary_cache = args.summary_cache
     if summary_cache is None:
         summary_cache = output_path.with_suffix(".npz")
     if not summary_cache.is_absolute():
-        summary_cache = repo_root / summary_cache
+        summary_cache = (repo_root / summary_cache).resolve()
     # Ensure parent folders exist before we attempt to save figures or cache files.
     output_path.parent.mkdir(parents=True, exist_ok=True)
     summary_cache.parent.mkdir(parents=True, exist_ok=True)
@@ -654,6 +731,12 @@ def main() -> int:
             "neural_label": neural_label,
             "neural_index": neural_idx,
         }
+        if results_dir_mode == "analysis" and analysis_root is not None:
+            analysis_settings["analysis_name"] = analysis_name
+            analysis_settings["analysis_root"] = str(analysis_root)
+            analysis_settings["single_subjects_dir"] = str(results_dir)
+            if group_level_dir is not None:
+                analysis_settings["group_level_dir"] = str(group_level_dir)
         np.savez_compressed(
             summary_cache_neural,
             avg_matrices=avg_matrices,

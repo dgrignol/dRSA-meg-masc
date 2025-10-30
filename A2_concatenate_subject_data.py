@@ -8,10 +8,12 @@ dependencies installed.
 """
 
 import argparse
+import ast
+import csv
 import json
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -111,6 +113,51 @@ class SegmentInfo:
     audio_paths: Dict[str, Path]
     envelope_paths: Dict[str, Path]
     n_times: int = 0
+    events_path: Path | None = None
+    word_onset_samples: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    sfreq: float | None = None
+
+
+def load_word_onset_samples(events_path: Path | None) -> np.ndarray:
+    """
+    Extract word onset sample indices from a BIDS events.tsv file.
+
+    Returns an empty array when the events file is missing or does not contain
+    any eligible word annotations.
+    """
+
+    if events_path is None or not events_path.exists():
+        return np.empty(0, dtype=np.int64)
+
+    onsets: List[int] = []
+    with events_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            try:
+                trial_info = ast.literal_eval(row.get("trial_type", ""))
+            except (ValueError, SyntaxError, TypeError):
+                continue
+            if not isinstance(trial_info, dict):
+                continue
+            if trial_info.get("kind") != "word":
+                continue
+            try:
+                pronounced = float(trial_info.get("pronounced", 1.0))
+            except (TypeError, ValueError):
+                pronounced = 1.0
+            if pronounced == 0.0:
+                continue
+            try:
+                onset_sample = int(row.get("sample", ""))
+            except (TypeError, ValueError):
+                continue
+            onsets.append(onset_sample)
+
+    if not onsets:
+        return np.empty(0, dtype=np.int64)
+
+    unique_sorted = sorted(set(onsets))
+    return np.asarray(unique_sorted, dtype=np.int64)
 
 
 def parse_args() -> argparse.Namespace:
@@ -156,7 +203,7 @@ def natural_sort_key(item: str) -> Tuple:
     return tuple(parts)
 
 
-def collect_segments(subject_dir: Path, envelope_root: Path) -> List[SegmentInfo]:
+def collect_segments(subject_dir: Path, envelope_root: Path, bids_root: Path) -> List[SegmentInfo]:
     """
     Locate all session/task folders that contain MEG FIF files.
 
@@ -169,6 +216,7 @@ def collect_segments(subject_dir: Path, envelope_root: Path) -> List[SegmentInfo
     if not subject_dir.exists():
         raise FileNotFoundError(f"Subject directory not found: {subject_dir}")
 
+    subject_label = subject_dir.name
     log(f"Scanning sessions for subject directory: {subject_dir}")
     for session_dir in sorted(subject_dir.glob("ses-*"), key=lambda p: natural_sort_key(p.name)):
         for task_dir in sorted(session_dir.glob("task-*"), key=lambda p: natural_sort_key(p.name)):
@@ -195,6 +243,17 @@ def collect_segments(subject_dir: Path, envelope_root: Path) -> List[SegmentInfo
                 if candidate.exists():
                     envelope_paths[key] = candidate
 
+            events_path = (
+                bids_root
+                / subject_label
+                / session
+                / "meg"
+                / f"{subject_label}_{session}_{task}_events.tsv"
+            )
+            if not events_path.exists():
+                log(f"    Warning: events file missing for {session}/{task}: {events_path}")
+                events_path = None
+
             log(f"  Located segment {session}/{task}")
             segments.append(
                 SegmentInfo(
@@ -204,6 +263,7 @@ def collect_segments(subject_dir: Path, envelope_root: Path) -> List[SegmentInfo
                     mask_paths=mask_paths,
                     audio_paths=audio_paths,
                     envelope_paths=envelope_paths,
+                    events_path=events_path,
                 )
             )
     if not segments:
@@ -239,8 +299,17 @@ def concatenate_meg(segments: Sequence[SegmentInfo]) -> Tuple[np.ndarray, Sequen
                     f"Channel mismatch between segments: {segments[0].meg_path.name} "
                     f"and {seg.meg_path.name}"
                 )
+        seg.sfreq = float(raw.info.get("sfreq", 0.0))
+        if seg.sfreq <= 0.0:
+            raise ValueError(f"Invalid sampling frequency reported for {seg.meg_path}: {seg.sfreq}")
         data_blocks.append(data)
         seg.n_times = data.shape[1]
+        seg.word_onset_samples = load_word_onset_samples(seg.events_path)
+        if seg.word_onset_samples.size:
+            log(
+                f"    {seg.session}/{seg.task}: captured {seg.word_onset_samples.size} word onsets "
+                f"(sfreq={seg.sfreq:g} Hz)."
+            )
         lengths.append(seg.n_times)
         file_labels.append(f"{seg.session}/{seg.task}")
 
@@ -335,6 +404,43 @@ def concatenate_audio(
     return audio_output_paths
 
 
+def concatenate_word_onsets_seconds(segments: Sequence[SegmentInfo]) -> np.ndarray:
+    """
+    Concatenate per-segment word onset timestamps (seconds) across the subject.
+
+    Word onsets are derived from the BIDS events.tsv files and validated against
+    the length of each MEG segment to ensure they fall within the recorded data.
+    """
+
+    onsets_seconds: List[float] = []
+    cumulative_time = 0.0
+
+    for seg in segments:
+        if seg.sfreq is None or seg.sfreq <= 0.0:
+            raise ValueError(f"Missing or invalid sampling frequency for segment {seg.session}/{seg.task}.")
+        if seg.n_times <= 0:
+            raise ValueError(f"Segment {seg.session}/{seg.task} has zero samples.")
+
+        if seg.word_onset_samples.size:
+            valid = seg.word_onset_samples[
+                (seg.word_onset_samples >= 0) & (seg.word_onset_samples < seg.n_times)
+            ]
+            if valid.size < seg.word_onset_samples.size:
+                dropped = seg.word_onset_samples.size - valid.size
+                log(
+                    f"    Dropped {dropped} word onsets outside valid range for {seg.session}/{seg.task}."
+                )
+            if valid.size:
+                onsets_seconds.extend(cumulative_time + (valid.astype(np.float64) / seg.sfreq))
+
+        cumulative_time += seg.n_times / seg.sfreq
+
+    if not onsets_seconds:
+        return np.empty(0, dtype=np.float64)
+
+    return np.sort(np.asarray(onsets_seconds, dtype=np.float64))
+
+
 def validate_lengths(
     meg_data: np.ndarray,
     masks: Dict[str, np.ndarray],
@@ -394,6 +500,7 @@ def save_outputs(
     masks: Dict[str, np.ndarray],
     audio_paths: Dict[str, Path],
     envelope_outputs: Dict[str, Path],
+    word_onsets_seconds: np.ndarray | None,
     segment_lengths: Sequence[int],
     segments: Sequence[SegmentInfo],
     overwrite: bool,
@@ -427,6 +534,14 @@ def save_outputs(
         mask_output_paths[metadata_key] = mask_path
         log(f"Saved mask '{mask_name}' to {mask_path}")
 
+    word_onsets_path: Path | None = None
+    if word_onsets_seconds is not None:
+        word_onsets_path = output_dir / f"{subject}_concatenated_word_onsets_sec.npy"
+        if word_onsets_path.exists() and not overwrite:
+            raise FileExistsError(f"{word_onsets_path} already exists. Use --overwrite to replace it.")
+        np.save(word_onsets_path, word_onsets_seconds.astype(np.float64, copy=False))
+        log(f"Saved word onset timestamps (seconds) to {word_onsets_path}")
+
     metadata_path = output_dir / f"{subject}_concatenation_metadata.json"
     if metadata_path.exists() and not overwrite:
         raise FileExistsError(f"{metadata_path} already exists. Use --overwrite to replace it.")
@@ -450,6 +565,11 @@ def save_outputs(
             "envelopes": {k: str(path) for k, path in envelope_outputs.items()},
             "masks": {name: str(path) for name, path in mask_output_paths.items()},
             "audio": {k: str(path) for k, path in audio_paths.items()},
+            "word_onsets_seconds": str(word_onsets_path) if word_onsets_path else None,
+        },
+        "word_onsets": {
+            "count": int(word_onsets_seconds.size if word_onsets_seconds is not None else 0),
+            "unit": "seconds",
         },
     }
     metadata_path.write_text(json.dumps(metadata, indent=2))
@@ -464,6 +584,7 @@ def main() -> None:
     derivatives_root = args.derivatives_root
     if not derivatives_root.is_absolute():
         derivatives_root = (repo_root / derivatives_root).resolve()
+    bids_root = (repo_root / "bids_anonym").resolve()
 
     subject_label = normalise_subject_label(args.subject)
     subject_dir = derivatives_root / "preprocessed" / subject_label
@@ -471,7 +592,7 @@ def main() -> None:
     output_dir = subject_dir / "concatenated"
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    segments = collect_segments(subject_dir, envelope_root)
+    segments = collect_segments(subject_dir, envelope_root, bids_root)
     meg_data, segment_lengths, _ = concatenate_meg(segments)
     masks = concatenate_masks(segments, segment_lengths)
 
@@ -484,6 +605,7 @@ def main() -> None:
     validate_lengths(meg_data, masks, envelopes=envelopes_for_validation, skip_envelope_keys=("native",))
 
     audio_paths = concatenate_audio(segments, output_dir, subject_label)
+    word_onsets_seconds = concatenate_word_onsets_seconds(segments)
     save_outputs(
         output_dir=output_dir,
         subject=subject_label,
@@ -491,6 +613,7 @@ def main() -> None:
         masks=masks,
         audio_paths=audio_paths,
         envelope_outputs=envelope_outputs,
+        word_onsets_seconds=word_onsets_seconds,
         segment_lengths=segment_lengths,
         segments=segments,
         overwrite=args.overwrite,
