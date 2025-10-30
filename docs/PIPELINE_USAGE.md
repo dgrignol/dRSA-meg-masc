@@ -294,6 +294,7 @@ General checklist:
    qsub s2_submit_python_wrapper_low_storage.sh    # per-subject loop
    qsub s2_submit_D1_group.sh                      # group aggregation only
    ```
+   Except for `s2_submit_D1_group.sh`, each helper tolerates an optional leading `--` before additional script arguments so you can keep `qsub` flags separate. For `s2_submit_D1_group.sh` pass extra options directly (no separator) so they reach `D1_group_cluster_analysis.py`.
 
 ### s2_submit_A1_preproc.sh – preprocessing array job
 Runs `A1_preprocess_data.py` with the subject ID derived from `SGE_TASK_ID`. The script ships with `#$ -t 1-27`, so submitting without extra arguments spawns one task per subject (01–27). Override the range at submit time to target specific participants.
@@ -456,8 +457,15 @@ Use this checklist to drive the entire pipeline with consistent analysis folders
         --subjects $(seq -w 1 27) \
         --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm"
       ```
+      ```bash
+      e.g.:
+      python D1_group_cluster_analysis.py --analysis-name "first_correlation_nolock_nooverlap" --subjects $(seq -w 1 27) --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm"
+      ```
     - Output: `results/$ANALYSIS_NAME/group_level/*` (PNG, PDF, NPZ)
-    - SGE: `qsub -v ANALYSIS_NAME="$ANALYSIS_NAME" s2_submit_D1_group.sh -- --subjects $(seq -w 1 27)`
+    - SGE: 
+      - `qsub -v ANALYSIS_NAME="$ANALYSIS_NAME" s2_submit_D1_group.sh --subjects $(seq -w 1 27)`
+      - e.g.: `qsub -v ANALYSIS_NAME=first_correlation_nolock_nooverlap s2_submit_D1_group.sh --subjects $(seq -w 1 27)`
+      - Omit the `--` separator when calling this helper; it forwards arguments directly to the Python command.
 
 12. **Wrapper alternatives (optional)**
     - Direct (full pipeline):  
