@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from matplotlib import pyplot as plt
+from scipy import ndimage
 from scipy.stats import ttest_rel, t
 
 from functions.generic_helpers import (
@@ -49,6 +50,9 @@ from functions.generic_helpers import (
 
 
 LOGGER = logging.getLogger(__name__)
+
+# Fixed seed for permutation sign choices (exposed in captions/settings for reproducibility)
+PERMUTATION_SEED = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,6 +116,23 @@ def parse_args() -> argparse.Namespace:
         help="Number of permutations for the cluster test (default: 5000).",
     )
     parser.add_argument(
+        "--force-matrix-clusters",
+        action="store_true",
+        help=(
+            "Run cluster permutation on the full dRSA matrices even when subsamples are not "
+            "locked to word onset (default behaviour only tests matrices when locking is enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--matrix-downsample-factor",
+        type=int,
+        default=1,
+        help=(
+            "Downsample factor applied to dRSA matrices before the permutation test "
+            "(must be a positive integer; 1 disables downsampling)."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -139,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default="DEBUG",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Verbosity level for console logging.",
     )
@@ -345,7 +366,7 @@ def permutation_cluster_test(
     cluster_sums = np.array([np.sum(t_vals[cluster]) for cluster in clusters], dtype=float)
 
     max_sums = np.zeros(n_permutations, dtype=float)
-    rng = np.random.default_rng(0)  # Fixed seed for reproducible cluster thresholds across runs.
+    rng = np.random.default_rng(PERMUTATION_SEED)  # Fixed seed for reproducible thresholds across runs.
 
     for i in range(n_permutations):
         signs = rng.choice([-1, 1], size=n_subjects)[:, None]
@@ -356,6 +377,14 @@ def permutation_cluster_test(
             max_sums[i] = np.max([abs(np.sum(t_perm[c])) for c in perm_clusters])
         else:
             max_sums[i] = 0.0
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            iteration = i + 1
+            if iteration == 10 or (iteration % 100 == 0):
+                LOGGER.debug(
+                    "Lag cluster permutation progress: %d/%d iterations completed.",
+                    iteration,
+                    n_permutations,
+                )
 
     cluster_threshold = np.quantile(max_sums, 1 - permutation_alpha)
     significant = np.zeros(n_times, dtype=bool)
@@ -367,12 +396,156 @@ def permutation_cluster_test(
     return significant, t_vals
 
 
+def permutation_cluster_test_matrix(
+    data: np.ndarray,
+    cluster_alpha: float,
+    permutation_alpha: float,
+    n_permutations: int,
+    connectivity: int = 1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Cluster permutation test for 2D dRSA matrices using sign-flipping across subjects.
+
+    Parameters
+    ----------
+    data:
+        Array of shape (n_subjects, dim_time, dim_time) containing per-subject dRSA matrices.
+    cluster_alpha:
+        Point-wise alpha used to form clusters.
+    permutation_alpha:
+        Alpha threshold applied to the permutation distribution of cluster-level statistics.
+    n_permutations:
+        Number of permutations used to build the null distribution.
+    connectivity:
+        Connectivity passed to ``ndimage.generate_binary_structure`` (default: 1 for 4-connectivity).
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray]
+        Boolean mask of significant samples with shape (dim_time, dim_time) and the t-statistic map.
+    """
+    if data.ndim != 3:
+        raise ValueError(
+            f"Matrix cluster test expects data with shape (subjects, time, time); received {data.shape}."
+        )
+    n_subjects = data.shape[0]
+    if n_subjects < 2:
+        LOGGER.warning(
+            "Matrix cluster permutation requires at least two subjects; returning no significant clusters."
+        )
+        return np.zeros_like(data[0], dtype=bool), np.zeros_like(data[0], dtype=np.float32)
+
+    t_vals, _ = ttest_rel(data, np.zeros_like(data), axis=0)
+    df = n_subjects - 1
+    threshold = abs(t.ppf(1 - cluster_alpha / 2, df))
+
+    supra_threshold = np.abs(t_vals) > threshold
+    structure = ndimage.generate_binary_structure(2, connectivity)
+    labeled, n_clusters = ndimage.label(supra_threshold, structure=structure)
+
+    cluster_ids = range(1, n_clusters + 1)
+    cluster_sums = np.array(
+        [np.sum(t_vals[labeled == cluster_id]) for cluster_id in cluster_ids], dtype=float
+    )
+
+    max_sums = np.zeros(n_permutations, dtype=float)
+    rng = np.random.default_rng(PERMUTATION_SEED)
+    zeros_like = np.zeros_like(data)
+
+    for perm_idx in range(n_permutations):
+        signs = rng.choice([-1, 1], size=n_subjects)[:, None, None]
+        permuted = data * signs
+        t_perm, _ = ttest_rel(permuted, zeros_like, axis=0)
+        supra_perm = np.abs(t_perm) > threshold
+        if np.any(supra_perm):
+            labeled_perm, n_perm_clusters = ndimage.label(supra_perm, structure=structure)
+            perm_cluster_sums = [
+                abs(np.sum(t_perm[labeled_perm == cluster_id]))
+                for cluster_id in range(1, n_perm_clusters + 1)
+            ]
+            max_sums[perm_idx] = max(perm_cluster_sums)
+        else:
+            max_sums[perm_idx] = 0.0
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            iteration = perm_idx + 1
+            if iteration == 10 or (iteration % 100 == 0):
+                LOGGER.debug(
+                    "Matrix cluster permutation progress: %d/%d iterations completed.",
+                    iteration,
+                    n_permutations,
+                )
+
+    cluster_threshold = np.quantile(max_sums, 1 - permutation_alpha)
+    significant = np.zeros_like(t_vals, dtype=bool)
+
+    for cluster_id, cluster_sum in zip(cluster_ids, cluster_sums):
+        if abs(cluster_sum) > cluster_threshold:
+            significant[labeled == cluster_id] = True
+
+    return significant, t_vals
+
+
 def compute_sem(data: np.ndarray, axis: int = 0) -> np.ndarray:
     """Return the standard error of the mean along the requested axis."""
     n = data.shape[axis]
     if n < 2:
         return np.zeros_like(data.take(indices=0, axis=axis), dtype=np.float32)
     return data.std(axis=axis, ddof=1) / np.sqrt(n)
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    """Convert diverse representations of booleans (including strings/ints) to bool."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, np.integer)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    return None
+
+
+def _extract_lock_to_word_onset(metadata: Dict[str, Any]) -> Optional[bool]:
+    """Extract the lock_subsample_to_word_onset flag from subject metadata if available."""
+    direct = _coerce_optional_bool(metadata.get("lock_subsample_to_word_onset"))
+    if direct is not None:
+        return direct
+    analysis_parameters = metadata.get("analysis_parameters")
+    if isinstance(analysis_parameters, dict):
+        nested = _coerce_optional_bool(analysis_parameters.get("lock_subsample_to_word_onset"))
+        if nested is not None:
+            return nested
+    return None
+
+
+def _downsample_matrix_stack(stack: np.ndarray, factor: int) -> np.ndarray:
+    """Downsample square matrices by averaging non-overlapping blocks."""
+    if factor <= 1:
+        return stack
+    if stack.ndim != 3:
+        raise ValueError(f"Expected (subjects, time, time) array; received shape {stack.shape}.")
+    n_subjects, height, width = stack.shape
+    if height % factor != 0 or width % factor != 0:
+        raise ValueError(
+            f"Matrix dimensions {height}x{width} are not divisible by downsample factor {factor}."
+        )
+    new_h = height // factor
+    new_w = width // factor
+    reshaped = stack.reshape(n_subjects, new_h, factor, new_w, factor)
+    return reshaped.mean(axis=(2, 4))
+
+
+def _upsample_matrix_mask(mask: np.ndarray, factor: int, target_shape: Tuple[int, int]) -> np.ndarray:
+    """Upsample a boolean mask produced on a coarse grid back to the original matrix size."""
+    if factor <= 1:
+        return mask.astype(bool, copy=False)
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D mask; received shape {mask.shape}.")
+    upsampled = np.kron(mask.astype(bool), np.ones((factor, factor), dtype=bool))
+    return upsampled[: target_shape[0], : target_shape[1]]
 
 
 def _format_analysis_caption(
@@ -399,12 +572,15 @@ def create_summary_plot(
     avg_lag_curves: np.ndarray,
     sem_lag_curves: np.ndarray,
     lags_sec: np.ndarray,
-    significance_masks: np.ndarray,
+    lag_significance_masks: np.ndarray,
     model_labels: Sequence[str],
     output_path: Path,
     vector_output_path: Optional[Path] = None,
     neural_label: Optional[str] = None,
     analysis_caption: Optional[str] = None,
+    matrix_significance_masks: Optional[np.ndarray] = None,
+    locked_to_word_onset: bool = False,
+    matrix_extent_sec: Optional[Tuple[float, float, float, float]] = None,
 ) -> None:
     """
     Build a figure summarising average dRSA matrices, lag curves, and significant clusters.
@@ -419,7 +595,7 @@ def create_summary_plot(
         Standard error of the mean for each lag curve with the same shape as ``avg_lag_curves``.
     lags_sec:
         Array of lag positions in seconds aligned with the lag curves.
-    significance_masks:
+    lag_significance_masks:
         Boolean array flagging significant time-points returned by ``permutation_cluster_test``.
     model_labels:
         Human-readable labels for the models (used in subplot titles and legend).
@@ -429,6 +605,10 @@ def create_summary_plot(
         Optional path for a vector export (e.g., PDF) of the same figure.
     analysis_caption:
         Optional string describing analysis parameters to display beneath the subplots.
+    matrix_significance_masks:
+        Optional boolean arrays highlighting significant samples within the dRSA matrices.
+    locked_to_word_onset:
+        Flag indicating whether subsamples were locked to word onset (annotated in the title).
     """
     n_models = len(model_labels)
     fig = plt.figure(figsize=(12, 3 * n_models + 0.75), constrained_layout=True)
@@ -461,19 +641,30 @@ def create_summary_plot(
         ax_matrix = axes[idx, 0]
         im = ax_matrix.imshow(
             avg_matrices[idx],
-            aspect="auto", 
+            aspect="auto",
             origin="lower",
             cmap="viridis",
+            extent=matrix_extent_sec if matrix_extent_sec is not None else None,
         )
         ax_matrix.set_title(f"{label} | Average dRSA")
-        ax_matrix.set_xlabel("Model time")
-        ax_matrix.set_ylabel("Neural time")
+        ax_matrix.set_xlabel("Model time (s)")
+        ax_matrix.set_ylabel("Neural time (s)")
         fig.colorbar(im, ax=ax_matrix, fraction=0.04, pad=0.00005)
+
+        # If using seconds extent, fix axis limits and prep coordinate grids for contours
+        x_coords = y_coords = None
+        if matrix_extent_sec is not None:
+            xmin, xmax, ymin, ymax = matrix_extent_sec
+            ax_matrix.set_xlim(xmin, xmax)
+            ax_matrix.set_ylim(ymin, ymax)
+            ny, nx = avg_matrices[idx].shape
+            x_coords = np.linspace(xmin, xmax, nx)
+            y_coords = np.linspace(ymin, ymax, ny)
 
         ax_lag = axes[idx, 1]
         curve = avg_lag_curves[idx]
         sem = sem_lag_curves[idx]
-        significant = significance_masks[idx]
+        significant = lag_significance_masks[idx]
 
         line_color = "#1f77b4"
         fill_color = "#9ecae1"
@@ -554,9 +745,35 @@ def create_summary_plot(
         if idx == 0:
             ax_lag.legend(loc="upper left")
 
-    title = "Group-level dRSA summary"
+        matrix_mask = None
+        if matrix_significance_masks is not None and idx < matrix_significance_masks.shape[0]:
+            matrix_mask = matrix_significance_masks[idx]
+        if matrix_mask is not None and np.any(matrix_mask):
+            if x_coords is not None and y_coords is not None:
+                ax_matrix.contour(
+                    x_coords,
+                    y_coords,
+                    matrix_mask.astype(float),
+                    levels=[0.5],
+                    colors="red",
+                    linewidths=0.8,
+                    linestyles="-",
+                )
+            else:
+                ax_matrix.contour(
+                    matrix_mask.astype(float),
+                    levels=[0.5],
+                    colors="red",
+                    linewidths=0.8,
+                    linestyles="-",
+                )
+
+    title_parts = ["Group-level dRSA summary"]
     if neural_label:
-        title = f"{title} | {neural_label}"
+        title_parts.append(neural_label)
+    if locked_to_word_onset:
+        title_parts.append("Locked to word onset")
+    title = " | ".join(title_parts)
     fig.suptitle(title, fontsize=14, fontweight="bold")
     if analysis_caption:
         caption_ax.text(0.5, 0.4, analysis_caption, ha="center", va="center", fontsize=8)
@@ -572,6 +789,9 @@ def main() -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+    # Suppress verbose Matplotlib DEBUG logs (e.g., findfont scoring) while keeping our own DEBUG output
+    logging.getLogger("matplotlib").setLevel(logging.INFO)
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
 
     # Resolve repository-relative paths so the script can run from any working directory.
     repo_root = read_repository_root()
@@ -688,7 +908,7 @@ def main() -> int:
                 avg_lag_curves = cache_payload["avg_lag_curves"]
                 sem_lag_curves = cache_payload["sem_lag_curves"]
                 lags_sec = cache_payload["lags_sec"]
-                significance_masks = cache_payload["significance_masks"]
+                lag_significance_masks = cache_payload["significance_masks"]
                 model_labels = cache_payload["model_labels"].tolist()
                 neural_label = cache_payload.get("neural_label", None)
                 if isinstance(neural_label, np.ndarray):
@@ -703,14 +923,23 @@ def main() -> int:
                     except ValueError:
                         analysis_caption = analysis_caption.tolist()
                 analysis_settings = _coerce_np_payload(cache_payload.get("analysis_settings"))
+                matrix_significance_masks = cache_payload.get("matrix_significance_masks", None)
+                if isinstance(matrix_significance_masks, np.ndarray):
+                    matrix_significance_masks = matrix_significance_masks.astype(bool)
+                else:
+                    matrix_significance_masks = np.zeros_like(avg_matrices, dtype=bool)
             output_path_local = output_path
             vector_output_local = vector_output_path
+            locked_to_word_onset_cached = False
             if isinstance(analysis_settings, dict):
                 output_path_local = _resolve_output_path(
                     analysis_settings.get("output_path"), output_path_local
                 )
                 vector_output_local = _resolve_output_path(
                     analysis_settings.get("vector_output_path"), vector_output_local
+                )
+                locked_to_word_onset_cached = bool(
+                    analysis_settings.get("locked_to_word_onset", False)
                 )
             else:
                 suffix = ""
@@ -724,17 +953,34 @@ def main() -> int:
                         f"{vector_output_local.stem}{suffix}{vector_output_local.suffix}"
                     )
 
+            # Attempt to recover matrix extent (seconds) from cached settings
+            matrix_extent_sec = None
+            if isinstance(analysis_settings, dict):
+                ap = analysis_settings.get("analysis_parameters")
+                if isinstance(ap, dict):
+                    try:
+                        res_hz = float(ap.get("resolution_hz"))
+                        subs_tps = int(ap.get("subsample_tps"))
+                        dur_sec = subs_tps / res_hz if res_hz > 0 else None
+                        if dur_sec is not None:
+                            matrix_extent_sec = (0.0, float(dur_sec), 0.0, float(dur_sec))
+                    except Exception:
+                        matrix_extent_sec = None
+
             create_summary_plot(
                 avg_matrices=avg_matrices,
                 avg_lag_curves=avg_lag_curves,
                 sem_lag_curves=sem_lag_curves,
                 lags_sec=lags_sec,
-                significance_masks=significance_masks,
+                lag_significance_masks=lag_significance_masks,
                 model_labels=model_labels,
                 output_path=output_path_local,
                 vector_output_path=vector_output_local,
                 neural_label=neural_label,
                 analysis_caption=analysis_caption,
+                matrix_significance_masks=matrix_significance_masks,
+                locked_to_word_onset=locked_to_word_onset_cached,
+                matrix_extent_sec=matrix_extent_sec,
             )
             LOGGER.info(
                 "Regenerated group summary figure (PNG: %s, PDF: %s) using cached results (%s).",
@@ -749,8 +995,18 @@ def main() -> int:
     if not args.models:
         raise ValueError("No models provided. Specify --models unless using --plot-only.")
 
+    matrix_downsample_factor = args.matrix_downsample_factor
+    if matrix_downsample_factor < 1:
+        raise ValueError("--matrix-downsample-factor must be a positive integer.")
+    if matrix_downsample_factor > 1:
+        LOGGER.info(
+            "Downsampling dRSA matrices by a factor of %d before matrix-level permutation tests.",
+            matrix_downsample_factor,
+        )
+
     subjects = [s.lstrip("sub-") for s in args.subjects]
     subject_data = []
+    lock_flags: List[Optional[bool]] = []
     lag_axis_reference: Optional[np.ndarray] = None
 
     for subject in subjects:
@@ -767,9 +1023,29 @@ def main() -> int:
             raise ValueError(
                 "Lag axis mismatch across subjects; ensure all subjects were analysed with the same settings."
             )
+        lock_flags.append(_extract_lock_to_word_onset(metadata))
 
     if lag_axis_reference is None:
         raise RuntimeError("Unable to determine lag axis from subject data.")
+
+    resolved_lock_flags = {flag for flag in lock_flags if flag is not None}
+    if len(resolved_lock_flags) > 1:
+        raise ValueError(
+            "Inconsistent lock_subsample_to_word_onset values across subjects; please verify inputs."
+        )
+    locked_to_word_onset = resolved_lock_flags.pop() if resolved_lock_flags else False
+    if not resolved_lock_flags and any(flag is None for flag in lock_flags):
+        LOGGER.warning(
+            "Could not determine lock_subsample_to_word_onset from metadata; defaulting to False."
+        )
+    if locked_to_word_onset:
+        LOGGER.info("Detected subsamples locked to word onset — enabling matrix-level cluster testing.")
+    elif args.force_matrix_clusters:
+        LOGGER.info(
+            "Matrix-level cluster testing forced via --force-matrix-clusters despite unlocked subsamples."
+        )
+
+    run_matrix_clusters = locked_to_word_onset or args.force_matrix_clusters
 
     n_models = len(args.models)
     n_subjects = len(subject_data)
@@ -802,8 +1078,12 @@ def main() -> int:
         ("cluster_alpha", args.cluster_alpha),
         ("permutation_alpha", args.permutation_alpha),
         ("n_permutations", args.n_permutations),
+        ("permutation_seed", PERMUTATION_SEED),
         ("n_subjects", len(subjects)),
         ("subjects", ", ".join(subjects)),
+        ("lock_subsample_to_word_onset", locked_to_word_onset),
+        ("matrix_cluster_analysis", run_matrix_clusters),
+        ("matrix_downsample_factor", matrix_downsample_factor),
     ]
 
     resolution = metadata_template["analysis_parameters"]["resolution_hz"]
@@ -822,7 +1102,7 @@ def main() -> int:
         avg_lag_curves = lag_curves_neural.mean(axis=0)
         sem_lag_curves = compute_sem(lag_curves_neural, axis=0)
 
-        significance_masks = []
+        lag_significance_masks = []
         for model_idx in range(n_models):
             significant, _ = permutation_cluster_test(
                 lag_curves_neural[:, model_idx, :],
@@ -830,8 +1110,34 @@ def main() -> int:
                 permutation_alpha=args.permutation_alpha,
                 n_permutations=args.n_permutations,
             )
-            significance_masks.append(significant)
-        significance_masks = np.array(significance_masks)
+            lag_significance_masks.append(significant)
+        lag_significance_masks = np.array(lag_significance_masks)
+
+        matrix_significance_masks = np.zeros_like(avg_matrices, dtype=bool)
+        if run_matrix_clusters:
+            for model_idx in range(n_models):
+                matrix_stack_model = matrices_neural[:, model_idx, :, :]
+                try:
+                    matrix_stack_down = _downsample_matrix_stack(
+                        matrix_stack_model, matrix_downsample_factor
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Failed to downsample matrices for model '{args.models[model_idx]}' "
+                        f"with factor {matrix_downsample_factor}: {exc}"
+                    ) from exc
+                matrix_significant_coarse, _ = permutation_cluster_test_matrix(
+                    matrix_stack_down,
+                    cluster_alpha=args.cluster_alpha,
+                    permutation_alpha=args.permutation_alpha,
+                    n_permutations=args.n_permutations,
+                )
+                matrix_significant_full = _upsample_matrix_mask(
+                    matrix_significant_coarse,
+                    matrix_downsample_factor,
+                    matrix_stack_model.shape[1:],
+                )
+                matrix_significance_masks[model_idx] = matrix_significant_full
 
         output_path_neural = _with_suffix(output_path, suffix)
         vector_output_neural = _with_suffix(vector_output_path, suffix)
@@ -845,23 +1151,31 @@ def main() -> int:
             avg_lag_curves=avg_lag_curves,
             sem_lag_curves=sem_lag_curves,
             lags_sec=lags_sec,
-            significance_masks=significance_masks,
+            lag_significance_masks=lag_significance_masks,
             model_labels=args.models,
             output_path=output_path_neural,
             vector_output_path=vector_output_neural,
             neural_label=neural_label,
             analysis_caption=analysis_caption,
+            matrix_significance_masks=matrix_significance_masks,
+            locked_to_word_onset=locked_to_word_onset,
+            matrix_extent_sec=(0.0, float(analysis_parameters_template.get("subsample_tps", matrices_neural.shape[-1]) / resolution),
+                               0.0, float(analysis_parameters_template.get("subsample_tps", matrices_neural.shape[-1]) / resolution)),
         )
 
         analysis_settings: Dict[str, Any] = {
             "cluster_alpha": args.cluster_alpha,
             "permutation_alpha": args.permutation_alpha,
             "n_permutations": args.n_permutations,
+            "permutation_seed": PERMUTATION_SEED,
             "lag_metric": args.lag_metric,
             "output_path": str(output_path_neural),
             "vector_output_path": str(vector_output_neural),
             "neural_label": neural_label,
             "neural_index": neural_idx,
+            "locked_to_word_onset": locked_to_word_onset,
+            "matrix_cluster_analysis": run_matrix_clusters,
+            "matrix_downsample_factor": matrix_downsample_factor,
         }
         analysis_settings["analysis_caption"] = analysis_caption
         analysis_settings["analysis_parameters"] = analysis_parameters_template
@@ -877,12 +1191,13 @@ def main() -> int:
             avg_lag_curves=avg_lag_curves,
             sem_lag_curves=sem_lag_curves,
             lags_sec=lags_sec,
-            significance_masks=significance_masks,
+            significance_masks=lag_significance_masks,
             model_labels=np.array(args.models, dtype=object),
             subjects=np.array(subjects, dtype=object),
             neural_label=np.array(neural_label, dtype=object),
             analysis_settings=np.array(analysis_settings, dtype=object),
             analysis_caption=np.array(analysis_caption, dtype=object),
+            matrix_significance_masks=matrix_significance_masks,
         )
 
         LOGGER.info(
