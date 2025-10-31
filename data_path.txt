@@ -1,3 +1,2 @@
 /mnt/storage/tier2/morwur/Projects/DAMIANO/SpeDiction/meg-masc
 /Volumes/MORWUR/Projects/DAMIANO/SpeDiction/meg-masc
-/Users/damiano/Documents/UniTn/Dynamo/dRSA_MEG_MASK/meg-masc

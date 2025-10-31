@@ -24,8 +24,15 @@ export PYTHONNOUSERSITE=1
 python -V
 which python
 
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+
+extra_args=("$@")
+
 subject=$(printf "%02d" "$SGE_TASK_ID")
 subject_label="sub-${subject}"
 echo ">>> Concatenating data for ${subject_label}"
 python A2_concatenate_subject_data.py \
-  --subject "${subject_label}"
+  --subject "${subject_label}" \
+  "${extra_args[@]}"

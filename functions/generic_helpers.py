@@ -46,6 +46,51 @@ def read_repository_root() -> Path:
     )
 
 
+def rebase_path_to_known_root(path: Union[str, Path]) -> Path:
+    """
+    When ``path`` points inside the repository but uses a root that is not
+    currently mounted (e.g., ``/Volumes`` vs ``/mnt``), substitute the root
+    with another candidate from ``data_path.txt`` that yields an existing file.
+    """
+
+    candidate_path = Path(path)
+    if candidate_path.exists() or not candidate_path.is_absolute():
+        return candidate_path
+
+    pointer = Path(__file__).parent.parent / "data_path.txt"
+    if not pointer.exists():
+        return candidate_path
+
+    candidate_roots = [Path(c).expanduser().resolve() for c in _iter_candidate_paths(pointer)]
+
+    relative_path = None
+    for root in candidate_roots:
+        try:
+            relative_path = candidate_path.relative_to(root)
+        except ValueError:
+            continue
+        else:
+            break
+
+    if relative_path is None:
+        return candidate_path
+
+    alternate_with_parent: Optional[Path] = None
+    candidate_parent_exists = candidate_path.parent.exists()
+
+    for root in candidate_roots:
+        remapped = (root / relative_path).resolve()
+        if remapped.exists():
+            return remapped
+        if alternate_with_parent is None and remapped.parent.exists():
+            alternate_with_parent = remapped
+
+    if not candidate_parent_exists and alternate_with_parent is not None:
+        return alternate_with_parent
+
+    return candidate_path
+
+
 @lru_cache(maxsize=1024)
 def _cached_directory_listing(directory: str) -> tuple[str, ...]:
     """Return child entry names for a directory, falling back to empty on failure."""

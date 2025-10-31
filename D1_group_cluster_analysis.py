@@ -32,9 +32,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Any
 import os
+import textwrap
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from matplotlib import pyplot as plt
@@ -374,6 +375,25 @@ def compute_sem(data: np.ndarray, axis: int = 0) -> np.ndarray:
     return data.std(axis=axis, ddof=1) / np.sqrt(n)
 
 
+def _format_analysis_caption(
+    analysis_parameters: Optional[Dict[str, Any]],
+    extra_entries: Sequence[Tuple[str, Any]],
+) -> Optional[str]:
+    caption_items: List[Tuple[str, Any]] = []
+    if analysis_parameters:
+        caption_items.extend(list(analysis_parameters.items()))
+    observed_keys = {key for key, _ in caption_items}
+    for key, value in extra_entries:
+        if key in observed_keys:
+            continue
+        caption_items.append((key, value))
+    if not caption_items:
+        return None
+    caption = ", ".join(f"{key}={value}" for key, value in caption_items)
+    caption = "Parameters: " + caption
+    return textwrap.fill(caption, width=110)
+
+
 def create_summary_plot(
     avg_matrices: np.ndarray,
     avg_lag_curves: np.ndarray,
@@ -384,6 +404,7 @@ def create_summary_plot(
     output_path: Path,
     vector_output_path: Optional[Path] = None,
     neural_label: Optional[str] = None,
+    analysis_caption: Optional[str] = None,
 ) -> None:
     """
     Build a figure summarising average dRSA matrices, lag curves, and significant clusters.
@@ -406,12 +427,31 @@ def create_summary_plot(
         Destination path for the rasterised PNG figure (directories created if necessary).
     vector_output_path:
         Optional path for a vector export (e.g., PDF) of the same figure.
+    analysis_caption:
+        Optional string describing analysis parameters to display beneath the subplots.
     """
     n_models = len(model_labels)
-    fig, axes = plt.subplots(n_models, 2, figsize=(12, 3 * n_models), constrained_layout=True)
+    fig = plt.figure(figsize=(12, 3 * n_models + 0.75), constrained_layout=True)
+    height_ratios = [1.0] * n_models + [0.25]
+    grid = fig.add_gridspec(n_models + 1, 2, height_ratios=height_ratios)
 
-    if n_models == 1:
-        axes = axes[None, :]
+# increase the padding between subplots for clarity
+#    layout_engine = fig.get_layout_engine()
+#    if layout_engine and hasattr(layout_engine, "set"):
+#        layout_engine.set(
+#            w_pad=4 / 72,
+#            h_pad=18 / 72,
+#            wspace=0.03,
+#            hspace=0.08,
+#        )
+
+    axes = np.empty((n_models, 2), dtype=object)
+    for idx in range(n_models):
+        axes[idx, 0] = fig.add_subplot(grid[idx, 0])
+        axes[idx, 1] = fig.add_subplot(grid[idx, 1])
+
+    caption_ax = fig.add_subplot(grid[-1, :])
+    caption_ax.axis("off")
 
     lag_span = float(lags_sec[-1] - lags_sec[0]) if lags_sec.size > 1 else 1.0
     cluster_marker_size = 10
@@ -421,22 +461,31 @@ def create_summary_plot(
         ax_matrix = axes[idx, 0]
         im = ax_matrix.imshow(
             avg_matrices[idx],
-            aspect="auto",
+            aspect="auto", 
             origin="lower",
             cmap="viridis",
         )
         ax_matrix.set_title(f"{label} | Average dRSA")
         ax_matrix.set_xlabel("Model time")
         ax_matrix.set_ylabel("Neural time")
-        fig.colorbar(im, ax=ax_matrix, fraction=0.046, pad=0.04)
+        fig.colorbar(im, ax=ax_matrix, fraction=0.04, pad=0.00005)
 
         ax_lag = axes[idx, 1]
         curve = avg_lag_curves[idx]
         sem = sem_lag_curves[idx]
         significant = significance_masks[idx]
 
-        ax_lag.plot(lags_sec, curve, color="k", label="Mean lag corr")
-        ax_lag.fill_between(lags_sec, curve - sem, curve + sem, color="gray", alpha=0.3, label="SEM")
+        line_color = "#1f77b4"
+        fill_color = "#9ecae1"
+        ax_lag.plot(lags_sec, curve, color=line_color, label="Mean lag corr")
+        ax_lag.fill_between(
+            lags_sec,
+            curve - sem,
+            curve + sem,
+            color=fill_color,
+            alpha=0.4,
+            label="SEM",
+        )
 
         if np.any(significant):
             sig_indices = np.where(significant)[0]
@@ -509,6 +558,8 @@ def create_summary_plot(
     if neural_label:
         title = f"{title} | {neural_label}"
     fig.suptitle(title, fontsize=14, fontweight="bold")
+    if analysis_caption:
+        caption_ax.text(0.5, 0.4, analysis_caption, ha="center", va="center", fontsize=8)
     fig.savefig(output_path, dpi=300)
     if vector_output_path is not None:
         fig.savefig(vector_output_path)
@@ -599,41 +650,98 @@ def main() -> int:
 
     if args.plot_only:
         # Recreate the plots directly from the cached group-level results.
-        if not summary_cache.exists():
-            raise FileNotFoundError(
-                f"Summary cache not found at {summary_cache}. Run without --plot-only first."
+        cache_candidates: List[Path] = []
+        if summary_cache.exists():
+            cache_candidates.append(summary_cache)
+        else:
+            cache_pattern = f"{summary_cache.stem}_*.npz"
+            cache_candidates.extend(
+                sorted(summary_cache.parent.glob(cache_pattern))
             )
-        with np.load(summary_cache, allow_pickle=True) as cache_payload:
-            avg_matrices = cache_payload["avg_matrices"]
-            avg_lag_curves = cache_payload["avg_lag_curves"]
-            sem_lag_curves = cache_payload["sem_lag_curves"]
-            lags_sec = cache_payload["lags_sec"]
-            significance_masks = cache_payload["significance_masks"]
-            model_labels = cache_payload["model_labels"].tolist()
-            neural_label = cache_payload.get("neural_label", None)
-            if isinstance(neural_label, np.ndarray):
-                try:
-                    neural_label = neural_label.item()
-                except ValueError:
-                    neural_label = neural_label.tolist()
+        if not cache_candidates:
+            raise FileNotFoundError(
+                f"Summary cache not found at {summary_cache}. "
+                "Run without --plot-only first."
+            )
 
-        create_summary_plot(
-            avg_matrices=avg_matrices,
-            avg_lag_curves=avg_lag_curves,
-            sem_lag_curves=sem_lag_curves,
-            lags_sec=lags_sec,
-            significance_masks=significance_masks,
-            model_labels=model_labels,
-            output_path=output_path,
-            vector_output_path=vector_output_path,
-            neural_label=neural_label,
-        )
-        LOGGER.info(
-            "Regenerated group summary figure (PNG: %s, PDF: %s) using cached results (%s).",
-            output_path,
-            vector_output_path,
-            summary_cache,
-        )
+        def _coerce_np_payload(value: Any) -> Any:
+            if isinstance(value, np.ndarray):
+                try:
+                    value = value.item()
+                except ValueError:
+                    value = value.tolist()
+            if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+                return value[0]
+            return value
+
+        def _resolve_output_path(path_value: Optional[str], fallback: Path) -> Path:
+            if not path_value:
+                return fallback
+            candidate = Path(path_value)
+            if not candidate.is_absolute():
+                candidate = (repo_root / candidate).resolve()
+            return candidate
+
+        for cache_path in cache_candidates:
+            with np.load(cache_path, allow_pickle=True) as cache_payload:
+                avg_matrices = cache_payload["avg_matrices"]
+                avg_lag_curves = cache_payload["avg_lag_curves"]
+                sem_lag_curves = cache_payload["sem_lag_curves"]
+                lags_sec = cache_payload["lags_sec"]
+                significance_masks = cache_payload["significance_masks"]
+                model_labels = cache_payload["model_labels"].tolist()
+                neural_label = cache_payload.get("neural_label", None)
+                if isinstance(neural_label, np.ndarray):
+                    try:
+                        neural_label = neural_label.item()
+                    except ValueError:
+                        neural_label = neural_label.tolist()
+                analysis_caption = cache_payload.get("analysis_caption", None)
+                if isinstance(analysis_caption, np.ndarray):
+                    try:
+                        analysis_caption = analysis_caption.item()
+                    except ValueError:
+                        analysis_caption = analysis_caption.tolist()
+                analysis_settings = _coerce_np_payload(cache_payload.get("analysis_settings"))
+            output_path_local = output_path
+            vector_output_local = vector_output_path
+            if isinstance(analysis_settings, dict):
+                output_path_local = _resolve_output_path(
+                    analysis_settings.get("output_path"), output_path_local
+                )
+                vector_output_local = _resolve_output_path(
+                    analysis_settings.get("vector_output_path"), vector_output_local
+                )
+            else:
+                suffix = ""
+                if cache_path.stem.startswith(summary_cache.stem):
+                    suffix = cache_path.stem[len(summary_cache.stem) :]
+                if suffix:
+                    output_path_local = output_path_local.with_name(
+                        f"{output_path_local.stem}{suffix}{output_path_local.suffix}"
+                    )
+                    vector_output_local = vector_output_local.with_name(
+                        f"{vector_output_local.stem}{suffix}{vector_output_local.suffix}"
+                    )
+
+            create_summary_plot(
+                avg_matrices=avg_matrices,
+                avg_lag_curves=avg_lag_curves,
+                sem_lag_curves=sem_lag_curves,
+                lags_sec=lags_sec,
+                significance_masks=significance_masks,
+                model_labels=model_labels,
+                output_path=output_path_local,
+                vector_output_path=vector_output_local,
+                neural_label=neural_label,
+                analysis_caption=analysis_caption,
+            )
+            LOGGER.info(
+                "Regenerated group summary figure (PNG: %s, PDF: %s) using cached results (%s).",
+                output_path_local,
+                vector_output_local,
+                cache_path,
+            )
         return 0
 
     if not args.subjects:
@@ -678,6 +786,26 @@ def main() -> int:
             "Mismatch between recorded neural signal labels and data dimensions in subject metadata."
         )
 
+    raw_analysis_parameters = metadata_template.get("analysis_parameters")
+    if raw_analysis_parameters is None:
+        analysis_parameters_template: Dict[str, Any] = {}
+    elif isinstance(raw_analysis_parameters, dict):
+        analysis_parameters_template = raw_analysis_parameters
+    else:
+        try:
+            analysis_parameters_template = dict(raw_analysis_parameters)
+        except TypeError:
+            analysis_parameters_template = {}
+
+    base_caption_entries: List[Tuple[str, Any]] = [
+        ("lag_metric", args.lag_metric),
+        ("cluster_alpha", args.cluster_alpha),
+        ("permutation_alpha", args.permutation_alpha),
+        ("n_permutations", args.n_permutations),
+        ("n_subjects", len(subjects)),
+        ("subjects", ", ".join(subjects)),
+    ]
+
     resolution = metadata_template["analysis_parameters"]["resolution_hz"]
     lags_sec = lag_axis_reference / resolution
     n_neural = matrices_stack.shape[1]
@@ -709,6 +837,9 @@ def main() -> int:
         vector_output_neural = _with_suffix(vector_output_path, suffix)
         summary_cache_neural = _with_suffix(summary_cache, suffix)
 
+        caption_entries = base_caption_entries + [("neural_label", neural_label)]
+        analysis_caption = _format_analysis_caption(analysis_parameters_template, caption_entries)
+
         create_summary_plot(
             avg_matrices=avg_matrices,
             avg_lag_curves=avg_lag_curves,
@@ -719,6 +850,7 @@ def main() -> int:
             output_path=output_path_neural,
             vector_output_path=vector_output_neural,
             neural_label=neural_label,
+            analysis_caption=analysis_caption,
         )
 
         analysis_settings: Dict[str, Any] = {
@@ -731,6 +863,8 @@ def main() -> int:
             "neural_label": neural_label,
             "neural_index": neural_idx,
         }
+        analysis_settings["analysis_caption"] = analysis_caption
+        analysis_settings["analysis_parameters"] = analysis_parameters_template
         if results_dir_mode == "analysis" and analysis_root is not None:
             analysis_settings["analysis_name"] = analysis_name
             analysis_settings["analysis_root"] = str(analysis_root)
@@ -748,6 +882,7 @@ def main() -> int:
             subjects=np.array(subjects, dtype=object),
             neural_label=np.array(neural_label, dtype=object),
             analysis_settings=np.array(analysis_settings, dtype=object),
+            analysis_caption=np.array(analysis_caption, dtype=object),
         )
 
         LOGGER.info(
