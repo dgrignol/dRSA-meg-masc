@@ -186,6 +186,8 @@ Aggregates subject dRSA results, performs a cluster-based permutation test, and 
   - `--analysis-name NAME` – analysis folder to read/write (default: latest analysis under `--results-root`).
   - `--results-root PATH` – parent directory containing analyses (default `results`).
   - `--subjects`, `--models`, `--lag-metric`, `--cluster-alpha`, `--permutation-alpha`, `--n-permutations` – unchanged.
+  - `--force-matrix-clusters` – force matrix-level cluster permutation even when subsamples are not word-onset locked (auto-enabled when metadata reports `lock_subsample_to_word_onset=True`).
+  - `--matrix-downsample-factor INT` – average matrices over INT×INT blocks before the permutation test (default 1, i.e. no downsampling).
   - `--results-dir` – legacy override pointing directly to subject-level outputs.
 - **Usage**
   ```bash
@@ -197,10 +199,25 @@ Aggregates subject dRSA results, performs a cluster-based permutation test, and 
 
   # Default: reuse the most recent analysis automatically
   python D1_group_cluster_analysis.py --subjects $(seq -w 1 10) --models Envelope "GloVe"
+
+  # Force matrix-level clusters even for unlocked subsamples
+  python D1_group_cluster_analysis.py \
+    --analysis-name lexical_mem_2024 \
+    --subjects $(seq -w 1 27) \
+    --models "Envelope" "GloVe" \
+    --force-matrix-clusters
   ```
 
   The `<NEURAL_LABEL>` suffix is derived from `metadata["neural_signal_labels"]` for the first subject. Spaces are converted to underscores (e.g., `MEG Full 1 → MEG_Full_1`). The figure title also includes the full label, so expect separate outputs such as `Group-level dRSA summary | MEG Full 2`. If only a single neural signal is present, the suffix still uses the label to keep filenames explicit.
   When using multiple neural signals, rerun the `--plot-only` command with each cache file produced during the initial analysis.
+
+- **Matrix-level cluster analysis**
+  - When subject metadata indicates `lock_subsample_to_word_onset=True`, the script performs 2D cluster permutation tests on the group dRSA matrices in addition to the lag curves. Significant matrix clusters are outlined in white on the heatmaps and stored in the `.npz` cache.
+  - Use `--force-matrix-clusters` to run the matrix permutation even if the metadata shows unlocked subsamples (default off). The `--n-permutations` value applies to both lag and matrix tests.
+  - `--matrix-downsample-factor` reduces matrix resolution before cluster testing (e.g., `--matrix-downsample-factor 2` averages 2×2 blocks for ~75% faster permutations; `--matrix-downsample-factor 4` averages 4×4 blocks for ~94% faster permutations; larger factors scale roughly with 1/factor²). The resulting significant blocks are projected back onto the full-resolution heatmap for plotting.
+  - Matrix permutation results are cached alongside the usual averages so replotting with `--plot-only` reproduces the overlays without recomputation.
+- **Logging**
+  - Default verbosity is now `DEBUG`, which prints progress messages at the 10th permutation and every subsequent 100 iterations for both lag and matrix cluster loops. Switch to `--log-level INFO` (or higher) to suppress detailed progress reporting.
 
 ---
 
