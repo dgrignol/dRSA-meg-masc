@@ -272,6 +272,52 @@ _register_model(wordfreq_path, "Word Frequency", "euclidean")
 _register_model(glove_path, "GloVe", "correlation")
 _register_model(glove_norm_path, "GloVe Norm", "euclidean")
 
+# Optional GPT next-token models
+gpt_next_path_candidates = [
+    os.path.join(
+        repo_root,
+        "derivatives",
+        "Models",
+        "gpt_next",
+        subject_label,
+        "concatenated",
+        f"{subject_label}_concatenated_gpt_next_100Hz.npy",
+    )
+]
+gpt_next_path = next((p for p in gpt_next_path_candidates if os.path.exists(p)), None)
+if gpt_next_path is not None:
+    _register_model(gpt_next_path, "GPT Next-Token", "correlation")
+
+# Predictability is currently disabled by request; enable via DRSA_MODELS filter if needed.
+
+gpt_surp_path_candidates = [
+    os.path.join(
+        repo_root,
+        "derivatives",
+        "Models",
+        "gpt_next",
+        subject_label,
+        "concatenated",
+        f"{subject_label}_concatenated_gpt_surprisal_100Hz.npy",
+    )
+]
+gpt_surp_path = next((p for p in gpt_surp_path_candidates if os.path.exists(p)), None)
+if gpt_surp_path is not None:
+    _register_model(gpt_surp_path, "GPT Surprisal", "euclidean")
+
+
+# Report selected models to log
+if model_filter_env:
+    print(f"DRSA_MODELS filter: {model_filter_env}")
+if selected_models_labels:
+    print("Selected models (label | features | metric | path):")
+    for mdl, lbl, mtr in zip(selected_models, selected_models_labels, model_rdm_metrics):
+        feats = int(np.atleast_2d(mdl).shape[0])
+        path = model_paths.get(lbl, "<unknown>")
+        print(f"  - {lbl} | {feats} | {mtr} | {path}")
+else:
+    print("Warning: no models selected after filtering and existence checks.")
+
 
 # ===== settings =====
 

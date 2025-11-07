@@ -507,4 +507,104 @@ Use this checklist to drive the entire pipeline with consistent analysis folders
 
 When launching any qsub job, always forward the analysis name with `-v ANALYSIS_NAME=…` so every node writes into the same `results/<analysis_name>/` tree.
 
+### B6_gpt_next_prediction.py
+Build GPT next-token prediction features aligned to the 100 Hz MEG timeline. For each token in the spoken stimulus, the model computes the distribution over the next token given left context, projects it to a compact feature space, and aligns features by evenly splitting each word’s duration across its tokens.
+
+- Input: Preprocessed concatenation metadata and BIDS events (A1/A2 outputs). Optionally a local GPT2 checkpoint in `derivatives/Models/gpt2/` to avoid downloads.
+- Output (per subject) under `derivatives/Models/gpt_next/<sub>/concatenated/`:
+  - `sub-XX_concatenated_gpt_next_100Hz.npy` (features × timepoints)
+  - `sub-XX_concatenated_gpt_predictability_100Hz.npy` (1 × timepoints)
+  - `sub-XX_concatenated_gpt_surprisal_100Hz.npy` (1 × timepoints)
+  - Metadata JSON and optional diagnostic plot
+- Key options:
+  - `--subjects sub-01 sub-02` – participants to process
+  - `--hf-model PATH|NAME` – defaults to `derivatives/Models/gpt2` if present, else `gpt2`
+  - `--context-tokens 512` – max left context tokens
+  - `--projection pca-embedding|expected-embedding` – default now `pca-embedding`
+  - `--components 64` – PCA components on expected embeddings (0 to disable)
+  - `--load-projection / --save-projection` – reuse or persist a PCA basis to keep it fixed across subjects
+  - `--positions-per-forward 256` – positions computed per forward pass (lower uses less memory)
+  - `--target-rate 100.0` – output rate in Hz
+  - `--device auto` – auto/cpu/cuda/mps
+  - `--noise-fill` / `--no-noise-fill` and `--noise-scale` – control Gaussian gap filling and coverage mask output
+  - `--plot` – save diagnostic plot (plus a context-usage histogram)
+- Usage
+  ```bash
+  # Activate env
+  source .venv/bin/activate
+
+  # Use local GPT2 weights (recommended)
+  python B6_gpt_next_prediction.py \
+    --subjects sub-01 \
+    --hf-model derivatives/Models/gpt2 \
+    --context-tokens 512 \
+    --components 64 \
+    --plot --overwrite --log-level INFO \
+    --save-projection derivatives/Models/gpt_next/pca_basis_ipca.pkl
+
+  # Or fetch from HF Hub if needed
+  python B6_gpt_next_prediction.py --subjects 01 --hf-model gpt2 --plot
+  ```
+
+Once generated, these models are automatically picked up by `C1_dRSA_run.py` if present. By default only "GPT Next-Token" (correlation RDM) and "GPT Surprisal" (euclidean) are registered; predictability is currently disabled.
+
+### B6_gpt_next_logprob_svd.py (recommended)
+Next-token model using streaming SVD directly on log-probability vectors with a single global projection basis pooled across all stories, plus story-level caching. This preserves distribution geometry and greatly reduces redundant compute across subjects.
+
+- Global basis: `derivatives/Models/gpt_next/global_svd_basis.pkl` (TruncatedSVD, randomized).
+- Story caches: `derivatives/Models/gpt_next/story_cache/<task>/` (reduced per-token features, surprisal, predictability, token map, hashes).
+- Mass-based sparsification: keep smallest K s.t. cumulative probability ≥ `--topk-mass` (default 0.99), cap at `--topk` (default 4096).
+- Scalars: computed from full logits (no truncation). Surprisal[0] = NaN by design.
+
+- Usage
+  ```bash
+  source .venv/bin/activate
+
+  # First subject: fit global basis, build caches, assemble
+  python B6_gpt_next_logprob_svd.py \
+    --subjects sub-01 \
+    --hf-model derivatives/Models/gpt2 \
+    --context-tokens 512 \
+    --components 64 \
+    --topk 4096 --topk-mass 0.99 \
+    --svd-fit-sample 100000 \
+    --plot --overwrite
+
+  # Additional subjects: reuses global basis and story caches
+  python B6_gpt_next_logprob_svd.py --subjects sub-02 sub-03 --hf-model derivatives/Models/gpt2 --components 64 --plot
+  ```
+
+### C1 dRSA Smoke Test with GPT models
+Run a lightweight C1 analysis that only includes the GPT models and locks subsample starts to word onsets. Results are written into a dedicated analysis folder.
+
+- Local (single subject):
+  ```bash
+  source .venv/bin/activate
+  DRSA_MODELS="GPT Next-Token,GPT Surprisal" \
+  python C1_dRSA_run.py sub-01 \
+    --analysis-name gpt_smoke \
+    --lock-subsample-to-word-onset \
+    --allow-overlap
+  ```
+  - Writes to `results/gpt_smoke/single_subjects/`.
+  - Requires `derivatives/preprocessed/sub-01/concatenated/sub-01_concatenated_word_onsets_sec.npy`.
+
+- Cluster (single subject smoke test):
+  ```bash
+  qsub -v ANALYSIS_NAME=gpt_smoke,DRSA_MODELS="GPT Next-Token,GPT Surprisal" \
+       -t 1 \
+       s2_submit_C1_subject.sh \
+       -- --lock-subsample-to-word-onset --allow-overlap
+  ```
+  - Adjust `-t` to a range (e.g., `1-27`) to scale up after the smoke test.
+
+  Alternative (robust env forwarding on SGE): export first, then use `-V` to forward the shell environment so commas in variables aren’t split by `-v`.
+  ```bash
+  export DRSA_MODELS="GPT Next-Token,GPT Surprisal"
+  qsub -V -v ANALYSIS_NAME=gpt_smoke \
+       -t 1 \
+       s2_submit_C1_subject.sh \
+       -- --lock-subsample-to-word-onset --allow-overlap
+  ```
+
 Happy analysing!

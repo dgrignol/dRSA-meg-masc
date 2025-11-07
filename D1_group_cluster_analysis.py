@@ -112,7 +112,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--n-permutations",
         type=int,
-        default=5000,
+        default=3000,
         help="Number of permutations for the cluster test (default: 5000).",
     )
     parser.add_argument(
@@ -121,6 +121,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Run cluster permutation on the full dRSA matrices even when subsamples are not "
             "locked to word onset (default behaviour only tests matrices when locking is enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--skip-matrix-clusters",
+        action="store_true",
+        help=(
+            "Skip matrix-level cluster permutation tests even if they would be auto-enabled "
+            "(useful for fast smoke runs)."
         ),
     )
     parser.add_argument(
@@ -1046,6 +1054,11 @@ def main() -> int:
         )
 
     run_matrix_clusters = locked_to_word_onset or args.force_matrix_clusters
+    if args.skip_matrix_clusters and run_matrix_clusters:
+        LOGGER.info(
+            "Skipping matrix-level cluster testing due to --skip-matrix-clusters flag."
+        )
+        run_matrix_clusters = False
 
     n_models = len(args.models)
     n_subjects = len(subject_data)
