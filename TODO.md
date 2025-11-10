@@ -1,9 +1,25 @@
 TODO:
-
+- run PCR/Lasso/ridge/elasticNet
 - choose sensors (temporal, speech, ATL)
-- different models 
-- lock to the word onset:
-    -
+- Add a flag to decide how much in advance to start subsample in respect to word onset (try centering the window on the word onset first e.g. 2.5 seconds in advance with a 5 seconds subsample window)
+- Other models:
+Voice activation (0 where silence 1 where speech)
+spectrogram
+wav2vec 2.0
+syntactic
+word2vec
+BERT 
+- check sentence mask definition and make plot with words printed
+- do simulations (autocorrelations) with different number of subsamples (e.g. 10, 100, 1000)
+- simulations will plot of autocorrelation one for subsample strategy
+- take out first N word onset from possibilities (start with N = 1)
+
+
+
+
+
+
+
 
 
 RUN NEXT:

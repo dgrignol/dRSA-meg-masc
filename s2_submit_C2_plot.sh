@@ -28,9 +28,10 @@ if [[ "${1:-}" == "--" ]]; then
   shift
 fi
 
-extra_args=("$@")
+# Work with a local args array to be safe under set -u
+ARGS=("$@")
 analysis_name_arg_present=false
-for arg in "${extra_args[@]}"; do
+for arg in "${ARGS[@]:-}"; do
   if [[ "$arg" == "--analysis-name" ]]; then
     analysis_name_arg_present=true
     break
@@ -60,7 +61,7 @@ PY
     fi
     echo ">>> Defaulting to latest analysis: ${analysis_name}"
   fi
-  extra_args+=("--analysis-name" "${analysis_name}")
+  ARGS+=("--analysis-name" "${analysis_name}")
 fi
 
 subject=$(printf "%02d" "$SGE_TASK_ID")
@@ -68,4 +69,4 @@ subject_label="sub-${subject}"
 echo ">>> Rendering dRSA plot for ${subject_label}"
 python C2_plot_dRSA.py \
   "${subject_label}" \
-  "${extra_args[@]}"
+  "${ARGS[@]}"
