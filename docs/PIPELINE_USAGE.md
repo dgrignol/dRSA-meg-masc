@@ -138,6 +138,7 @@ Runs the subject-level dynamic RSA analysis.
   - `--analysis-name NAME` – recommended; names the analysis folder under `results/` (default: timestamp such as `20240130_143210`).
   - `--results-root PATH` – parent directory that will contain the analysis folder (default: `results`).
   - `--lock-subsample-to-word-onset` – restrict subsample starts to the concatenated word onset timestamps (requires the numpy file written by A2).
+  - `--word-onset-alignment {center,start}` – when locking, center windows on each onset (default) or start them at the onset to reproduce the legacy behavior.
   - `--allow-overlap` – allow subsample windows to overlap (handy when the onset density is low; compatible with and without locking).
 - **Usage**
   ```bash
@@ -147,7 +148,7 @@ Runs the subject-level dynamic RSA analysis.
   # Quick run: auto-generate a timestamped folder under results/
   python C1_dRSA_run.py 03
   ```
-- **Word onset workflows**: When `derivatives/preprocessed/<subject>/concatenated/<subject>_concatenated_word_onsets_sec.npy` exists, C1 hashes the timestamps for caching, records their provenance inside the metadata JSON, and overlays them on the subsampling QC figure. Passing `--lock-subsample-to-word-onset` enforces that every subsample starts at a word onset (after trimming windows that would overrun the recording). Toggling either `--lock-subsample-to-word-onset` or `--allow-overlap` automatically invalidates the subsample cache so reruns remain reproducible.
+- **Word onset workflows**: When `derivatives/preprocessed/<subject>/concatenated/<subject>_concatenated_word_onsets_sec.npy` exists, C1 hashes the timestamps for caching, records their provenance inside the metadata JSON, and overlays them on the subsampling QC figure. Passing `--lock-subsample-to-word-onset` enforces that every subsample window is anchored to a word onset; the window is centered on the onset by default, and `--word-onset-alignment start` reproduces the legacy start-aligned behavior. Toggling `--lock-subsample-to-word-onset`, `--word-onset-alignment`, or `--allow-overlap` automatically invalidates the subsample cache so reruns remain reproducible.
 - **Tuning**: Edit the constants near the bottom of the file (e.g., `averaging_diagonal_time_window_sec`, `n_subsamples`) to adjust the analysis.
 
 ### C2_plot_dRSA.py
@@ -575,7 +576,7 @@ Next-token model using streaming SVD directly on log-probability vectors with a 
   ```
 
 ### C1 dRSA Smoke Test with GPT models
-Run a lightweight C1 analysis that only includes the GPT models and locks subsample starts to word onsets. Results are written into a dedicated analysis folder.
+Run a lightweight C1 analysis that only includes the GPT models and locks subsample windows to word onsets (centered by default). Results are written into a dedicated analysis folder.
 
 - Local (single subject):
   ```bash
@@ -588,6 +589,7 @@ Run a lightweight C1 analysis that only includes the GPT models and locks subsam
   ```
   - Writes to `results/gpt_smoke/single_subjects/`.
   - Requires `derivatives/preprocessed/sub-01/concatenated/sub-01_concatenated_word_onsets_sec.npy`.
+  - Optional: append `--word-onset-alignment start` to reproduce the legacy start-aligned windows.
 
 - Cluster (single subject smoke test):
   ```bash
@@ -597,6 +599,7 @@ Run a lightweight C1 analysis that only includes the GPT models and locks subsam
        -- --lock-subsample-to-word-onset --allow-overlap
   ```
   - Adjust `-t` to a range (e.g., `1-27`) to scale up after the smoke test.
+  - Add `--word-onset-alignment start` after the double dash to keep the legacy alignment.
 
   Alternative (robust env forwarding on SGE): export first, then use `-V` to forward the shell environment so commas in variables aren’t split by `-v`.
   ```bash
@@ -606,5 +609,6 @@ Run a lightweight C1 analysis that only includes the GPT models and locks subsam
        s2_submit_C1_subject.sh \
        -- --lock-subsample-to-word-onset --allow-overlap
   ```
+  - Use the same `--word-onset-alignment start` suffix here if you prefer start-aligned windows.
 
 Happy analysing!

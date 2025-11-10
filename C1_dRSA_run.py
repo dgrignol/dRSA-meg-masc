@@ -47,6 +47,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Allow subsample windows to overlap when drawing random starts.",
     )
+    parser.add_argument(
+        "--word-onset-alignment",
+        choices=("center", "start"),
+        default="center",
+        help=(
+            "When locking subsamples to word onsets, center the window on the onset (default) "
+            "or treat the onset as the window start."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -68,6 +77,12 @@ def compute_array_signature(values, dtype):
 
 # CLI + repository root
 args = parse_args()
+
+if not args.lock_subsample_to_word_onset and args.word_onset_alignment != "center":
+    print(
+        "Warning: --word-onset-alignment has no effect unless --lock-subsample-to-word-onset is set."
+    )
+
 repo_root = read_repository_root()
 
 if args.results_root.is_absolute():
@@ -404,6 +419,9 @@ analysis_parameters = {
     "averaging_window_tps": adtw_in_tps,
     "subsample_tps": subsample_tps,
     "subsampling_random_state": subsampling_random_state,
+    "word_onset_alignment": (
+        args.word_onset_alignment if args.lock_subsample_to_word_onset else None
+    ),
 }
 
 if word_onsets_path is not None:
@@ -444,23 +462,37 @@ else:
     word_onset_seconds_signature = "none"
 
 if word_onset_seconds is not None:
-    scaled_starts = np.rint(word_onset_seconds * resolution)
-    finite_scaled = scaled_starts[np.isfinite(scaled_starts)]
-    candidate_indices_all = np.asarray(finite_scaled, dtype=np.int64)
-    if candidate_indices_all.size:
-        candidate_indices_all = np.unique(candidate_indices_all[candidate_indices_all >= 0])
+    scaled_onsets = np.rint(word_onset_seconds * resolution)
+    finite_scaled = scaled_onsets[np.isfinite(scaled_onsets)]
+    onset_indices = np.asarray(finite_scaled, dtype=np.float64)
+    if onset_indices.size:
+        onset_indices = np.unique(onset_indices[onset_indices >= 0.0])
     else:
-        candidate_indices_all = np.empty(0, dtype=np.int64)
-    word_onset_candidate_total = int(candidate_indices_all.size)
+        onset_indices = np.empty(0, dtype=np.float64)
+
+    if args.word_onset_alignment == "center":
+        half_window = (subsample_tps - 1) / 2.0
+        aligned_candidates = np.rint(onset_indices - half_window)
+    else:
+        aligned_candidates = onset_indices
+
+    aligned_candidates = aligned_candidates.astype(np.int64, copy=False)
+    if aligned_candidates.size:
+        aligned_candidates = np.unique(aligned_candidates[aligned_candidates >= 0])
+    else:
+        aligned_candidates = np.empty(0, dtype=np.int64)
+
+    word_onset_candidate_total = int(aligned_candidates.size)
     max_start = max(0, tps - subsample_tps)
-    candidate_indices_within_bounds = candidate_indices_all[candidate_indices_all <= max_start]
+    candidate_indices_within_bounds = aligned_candidates[aligned_candidates <= max_start]
     word_onset_candidate_within_bounds = int(candidate_indices_within_bounds.size)
     word_onset_candidate_starts = candidate_indices_within_bounds
     word_onset_candidate_signature = compute_array_signature(candidate_indices_within_bounds, dtype=np.int64)
     word_onset_candidate_trimmed = word_onset_candidate_total - word_onset_candidate_within_bounds
     if args.lock_subsample_to_word_onset and word_onset_candidate_within_bounds == 0:
         raise ValueError(
-            "--lock-subsample-to-word-onset requested but no word onset permits a full subsample window. "
+            "--lock-subsample-to-word-onset requested but no word onset permits a full subsample window "
+            f"with word_onset_alignment='{args.word_onset_alignment}'. "
             f"Check {word_onsets_path} and consider adjusting the subsample duration ({SubSampleDurSec} s)."
         )
     if word_onset_count:
@@ -472,8 +504,8 @@ if word_onset_seconds is not None:
             print(f"Loaded {word_onset_count} word onset timestamps.")
     if args.lock_subsample_to_word_onset:
         print(
-            f"Locking subsample starts to {word_onset_candidate_within_bounds} word onsets "
-            f"(allow_overlap={args.allow_overlap})."
+            f"Locking subsample windows to {word_onset_candidate_within_bounds} "
+            f"{args.word_onset_alignment}-aligned onset start(s) (allow_overlap={args.allow_overlap})."
         )
         if word_onset_candidate_trimmed > 0:
             print(
@@ -481,7 +513,8 @@ if word_onset_seconds is not None:
             )
     elif word_onset_candidate_within_bounds:
         print(
-            f"Word onsets align to {word_onset_candidate_within_bounds} candidate subsample starts at {resolution} Hz."
+            f"Word onsets supply {word_onset_candidate_within_bounds} "
+            f"{args.word_onset_alignment}-aligned candidate start(s) at {resolution} Hz."
         )
 else:
     word_onset_candidate_signature = "none"
@@ -532,6 +565,9 @@ subsample_cache_key = json.dumps(
         "lock_subsample_to_word_onset": args.lock_subsample_to_word_onset,
         "allow_overlap": args.allow_overlap,
         "word_onset_signature": cache_onset_signature,
+        "word_onset_alignment": (
+            args.word_onset_alignment if args.lock_subsample_to_word_onset else None
+        ),
         "word_onset_candidate_within_bounds": (
             word_onset_candidate_within_bounds if args.lock_subsample_to_word_onset else None
         ),
@@ -673,6 +709,7 @@ analysis_metadata = {
     "task_label": task_label,
     "frequency_band": frequency_band,
     "lock_subsample_to_word_onset": args.lock_subsample_to_word_onset,
+    "word_onset_alignment": args.word_onset_alignment,
     "allow_overlap": args.allow_overlap,
     "meg_path": str(MEG_path),
     "model_paths": model_paths,
@@ -706,6 +743,7 @@ analysis_metadata = {
         "sampling_rate_hz": resolution,
         "subsample_window_seconds": SubSampleDurSec,
         "lock_subsample_to_word_onset": args.lock_subsample_to_word_onset,
+        "alignment": args.word_onset_alignment if word_onset_seconds is not None else None,
         "allow_overlap": args.allow_overlap,
     },
     "analysis_paths": {
@@ -722,6 +760,9 @@ analysis_metadata = {
         "plot": str(subsample_plot_path),
         "plot_exists": subsample_plot_exists,
         "lock_subsample_to_word_onset": args.lock_subsample_to_word_onset,
+        "word_onset_alignment": (
+            args.word_onset_alignment if args.lock_subsample_to_word_onset else None
+        ),
         "allow_overlap": args.allow_overlap,
         "word_onset_signature": cache_onset_signature,
         "word_onset_seconds_signature": word_onset_seconds_signature,

@@ -66,7 +66,7 @@ fi
 
 python D1_group_cluster_analysis.py \
   --subjects $(seq -w 1 27) \
-  --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm" \
+  --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm" "GPT Next-Token" "GPT Surprisal"\
   --results-root results \
   --lag-metric correlation \
   "${extra_args[@]}"

@@ -1,8 +1,7 @@
 TODO:
-
+- run PCR/Lasso/ridge/elasticNet
 - choose sensors (temporal, speech, ATL)
 - Add a flag to decide how much in advance to start subsample in respect to word onset (try centering the window on the word onset first e.g. 2.5 seconds in advance with a 5 seconds subsample window)
-- run PCR/Lasso/ridge
 - Other models:
 Voice activation (0 where silence 1 where speech)
 spectrogram
