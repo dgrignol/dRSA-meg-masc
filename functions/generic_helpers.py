@@ -162,6 +162,21 @@ def resolve_relative_path_casefold(base: Path, relative: Union[str, Path]) -> Op
 
 _ANALYSIS_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
 _ANALYSIS_TIMESTAMP_PATTERN = re.compile(r"^(\d{8})_(\d{6})(?:[._-].*)?$")
+_LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def format_log_timestamp(moment: Optional[datetime] = None) -> str:
+    """
+    Return the ``YYYY-MM-DD HH:MM:SS`` timestamp string for log messages.
+
+    Parameters
+    ----------
+    moment : datetime, optional
+        Moment to format. ``datetime.now()`` is used when omitted.
+    """
+
+    reference = moment or datetime.now()
+    return reference.strftime(_LOG_TIMESTAMP_FORMAT)
 
 
 def generate_timestamped_analysis_name(moment: Optional[datetime] = None) -> str:

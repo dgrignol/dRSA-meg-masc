@@ -10,8 +10,8 @@ syntactic
 word2vec
 BERT 
 - check sentence mask definition and make plot with words printed
-- do simulations (autocorrelations) with different number of subsamples (e.g. 10, 100, 1000)
-- simulations will plot of autocorrelation one for subsample strategy
+- run `python C1_dRSA_run.py --simulation ...` to generate autocorrelations with different numbers of subsamples (e.g. 10, 100, 1000)
+- use `python C2_plot_dRSA.py ...` to automatically emit plots for every simulation run alongside the standard analysis
 - take out first N word onset from possibilities (start with N = 1)
 
 

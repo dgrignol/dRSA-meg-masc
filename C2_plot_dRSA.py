@@ -11,6 +11,7 @@ import numpy as np
 from functions.core_functions import compute_lag_correlation
 from functions.generic_helpers import (
     find_latest_analysis_directory,
+    format_log_timestamp,
     normalise_analysis_name,
     read_repository_root,
     rebase_path_to_known_root,
@@ -80,6 +81,7 @@ def generate_plots(
     """
     adtw_in_tps = analysis_parameters["averaging_window_tps"]
     resolution = analysis_parameters["resolution_hz"]
+    caption_timestamp = format_log_timestamp()
 
     lag_curves_available = lag_curves_array is not None
     if lag_curves_available:
@@ -219,14 +221,14 @@ def generate_plots(
             if model_idx == 0:
                 ax_lag.legend(loc="upper left", fontsize=8)
 
-        parameter_caption = ", ".join(
-            f"{key}={value}" for key, value in analysis_parameters.items()
-        )
+        parameter_pairs = list(analysis_parameters.items()) if analysis_parameters else []
+        parameter_pairs.append(("timestamp", caption_timestamp))
+        parameter_caption = ", ".join(f"{key}={value}" for key, value in parameter_pairs)
         parameter_caption = "Parameters: " + parameter_caption
         parameter_caption = textwrap.fill(parameter_caption, width=110)
 
         fig.suptitle(f"{neural_label} dRSA summary", fontsize=14, fontweight="bold")
-        fig.text(0.5, 0.02, parameter_caption, ha="center", va="center", fontsize=8)
+        fig.text(0.5, 0.005, parameter_caption, ha="center", va="center", fontsize=8)
 
         base, ext = os.path.splitext(plot_path)
         ext = ext or ".png"
@@ -239,6 +241,242 @@ def generate_plots(
         saved_paths.append(figure_path)
         plt.close(fig)
     return saved_paths
+
+
+def discover_metadata_files(
+    results_dir: Path,
+    base_run_id: str,
+    include_base: bool = True,
+    include_simulations: bool = True,
+) -> list[Path]:
+    """Return metadata files for the requested run id within a directory."""
+    results_dir = Path(results_dir)
+    metadata_files: list[Path] = []
+    if include_base:
+        base_metadata = results_dir / f"{base_run_id}_metadata.json"
+        if base_metadata.exists():
+            metadata_files.append(base_metadata)
+    if include_simulations:
+        sim_pattern = f"{base_run_id}_sim_*_metadata.json"
+        metadata_files.extend(sorted(results_dir.glob(sim_pattern)))
+    return metadata_files
+
+
+def generate_autocorr_summary_plot(
+    entries: list[dict],
+    plot_path: Path,
+) -> Path:
+    """Render stacked autocorrelation plots (matrix + lag curve) for simulation runs."""
+    if not entries:
+        return plot_path
+
+    entries_sorted = sorted(entries, key=lambda item: item.get("order", 0))
+    plot_path = Path(plot_path)
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+
+    n_rows = len(entries_sorted)
+    fig, axs = plt.subplots(
+        n_rows,
+        2,
+        figsize=(12, max(3.0, 3.0 * n_rows)),
+        squeeze=False,
+        constrained_layout=True,
+    )
+
+    for row_idx, entry in enumerate(entries_sorted):
+        rsa_matrix = entry["rsa_matrix"]
+        analysis_parameters = entry["analysis_parameters"]
+        lag_bootstrap_settings = entry["lag_bootstrap_settings"]
+        label = entry["label"]
+
+        ax_matrix = axs[row_idx, 0]
+        ax_lag = axs[row_idx, 1]
+
+        im = ax_matrix.imshow(rsa_matrix, cmap="viridis", aspect="auto", origin="lower")
+        ax_matrix.set_title(label, fontsize=10, fontweight="bold")
+        ax_matrix.set_xlabel("Model time", fontsize=8)
+        ax_matrix.set_ylabel("Neural time", fontsize=8)
+        fig.colorbar(im, ax=ax_matrix, fraction=0.046, pad=0.04)
+
+        adtw_in_tps = analysis_parameters["averaging_window_tps"]
+        resolution = analysis_parameters["resolution_hz"]
+        lags_tp, lag_corr = compute_lag_correlation(rsa_matrix, adtw_in_tps)
+        lags_sec = lags_tp / resolution
+
+        ax_lag.plot(lags_sec, lag_corr, color="black", linewidth=1.1, label="Lag corr")
+
+        lag_samples = entry.get("lag_samples")
+        lag_bootstrap_iterations = lag_bootstrap_settings.get("iterations", 0)
+        lag_bootstrap_confidence = lag_bootstrap_settings.get("confidence", 0.95)
+        lag_bootstrap_random_state = lag_bootstrap_settings.get("random_state", None)
+        if lag_samples is not None and lag_bootstrap_iterations:
+            ci_lower, ci_upper = bootstrap_mean_ci(
+                lag_samples,
+                n_bootstraps=lag_bootstrap_iterations,
+                confidence=lag_bootstrap_confidence,
+                random_state=lag_bootstrap_random_state,
+            )
+            ax_lag.fill_between(
+                lags_sec,
+                ci_lower,
+                ci_upper,
+                color="gray",
+                alpha=0.3,
+                label="CI",
+            )
+
+        ax_lag.axvline(0, color="black", linestyle="--", linewidth=0.75)
+        ax_lag.axhline(0, color="black", linestyle="--", linewidth=0.75)
+        ax_lag.set_xlabel("Lag (neural - model) [s]", fontsize=8)
+        ax_lag.set_ylabel("Correlation", fontsize=8)
+        ax_lag.set_title(f"{label}", fontsize=10, fontweight="bold")
+
+        peak_idx = np.argmax(lag_corr)
+        peak_lag = lags_sec[peak_idx]
+        peak_val = lag_corr[peak_idx]
+        ax_lag.scatter(
+            [peak_lag],
+            [peak_val],
+            color="red",
+            edgecolors="white",
+            linewidths=0.5,
+            s=12,
+            zorder=5,
+        )
+
+        direction_x = 1 if peak_lag >= 0 else -1
+        if np.isclose(peak_lag, 0.0):
+            direction_x = 1
+        direction_y = 1 if peak_val >= 0 else -1
+        if np.isclose(peak_val, 0.0):
+            direction_y = 1
+        lag_span = float(lags_sec[-1] - lags_sec[0]) if lags_sec.size > 1 else 1.0
+        curve_span = float(np.ptp(lag_corr)) or 1.0
+        text_dx = 0.03 * lag_span * direction_x
+        text_dy = 0.08 * curve_span * direction_y
+        ax_lag.annotate(
+            f"Peak: {peak_val:.3f}\nLag: {peak_lag:.3f}s",
+            xy=(peak_lag, peak_val),
+            xytext=(peak_lag + text_dx, peak_val + text_dy),
+            textcoords="data",
+            arrowprops=dict(arrowstyle="->", color="red", lw=0.8),
+            fontsize=8,
+            color="red",
+            ha="left" if direction_x >= 0 else "right",
+            va="bottom" if direction_y >= 0 else "top",
+        )
+        if row_idx == 0:
+            ax_lag.legend(loc="upper left", fontsize=8)
+
+    parameter_caption = ", ".join(
+        f"{key}={value}" for key, value in entries_sorted[0]["analysis_parameters"].items()
+    )
+    parameter_caption = "Parameters: " + parameter_caption
+    parameter_caption = textwrap.fill(parameter_caption, width=110)
+    fig.suptitle("Simulation autocorrelations", fontsize=14, fontweight="bold")
+    fig.text(0.5, 0.005, parameter_caption, ha="center", va="center", fontsize=8)
+    fig.savefig(plot_path, dpi=300)
+    plt.close(fig)
+    return plot_path
+
+
+def plot_run_from_metadata(
+    metadata_path: Path, results_dir: Path
+) -> tuple[str, list[str], dict | None]:
+    """Load metadata for a single run and generate the corresponding plots."""
+    with metadata_path.open("r") as f:
+        metadata = json.load(f)
+
+    run_id = metadata.get("analysis_run_id") or metadata_path.stem.replace("_metadata", "")
+    outputs = metadata.get("outputs", {})
+
+    def resolve_output_path(
+        key: str, fallback_name: str, require_exists: bool = True
+    ) -> tuple[Path, list[Path]]:
+        stored_path = outputs.get(key)
+        attempts: list[Path] = []
+        if stored_path:
+            candidate = rebase_path_to_known_root(Path(stored_path))
+            if not candidate.is_absolute():
+                candidate = (results_dir / candidate).resolve()
+            attempts.append(candidate)
+            if not require_exists or candidate.exists():
+                return candidate, attempts
+        fallback_path = results_dir / Path(fallback_name)
+        attempts.append(fallback_path)
+        if not require_exists or fallback_path.exists():
+            return fallback_path, attempts
+        return fallback_path, attempts
+
+    rsa_default = f"{run_id}_dRSA_matrices.npy"
+    rsa_matrices_path, rsa_attempts = resolve_output_path("rsa_matrices", rsa_default)
+    if not rsa_matrices_path.exists():
+        attempted = ", ".join(str(p) for p in rsa_attempts)
+        raise FileNotFoundError(
+            f"[{run_id}] RSA matrices file not found after checking: {attempted}"
+        )
+    rsa_matrices = np.load(rsa_matrices_path)
+
+    lag_default = f"{run_id}_lag_curves.npy"
+    lag_curves_path, lag_attempts = resolve_output_path("lag_curves", lag_default)
+    lag_curves_array = None
+    if lag_curves_path.exists():
+        lag_curves_array = np.load(lag_curves_path)
+    else:
+        if outputs.get("lag_curves"):
+            attempted = ", ".join(str(p) for p in lag_attempts)
+            print(f"! [{run_id}] lag curves referenced in metadata but missing: {attempted}")
+        else:
+            print(f"! [{run_id}] lag curves not available; plotting without confidence intervals.")
+
+    plot_default = f"{run_id}_plot.png"
+    if outputs.get("plot_target"):
+        plot_path, _ = resolve_output_path("plot_target", plot_default, require_exists=False)
+    elif outputs.get("plot"):
+        plot_path, _ = resolve_output_path("plot", plot_default, require_exists=False)
+    else:
+        plot_path = results_dir / plot_default
+
+    model_labels = metadata["selected_model_labels"]
+    neural_labels = metadata["neural_signal_labels"]
+    analysis_parameters = metadata["analysis_parameters"]
+    lag_bootstrap_settings = metadata.get("lag_bootstrap_settings", {})
+
+    saved_paths = generate_plots(
+        rsa_matrices,
+        lag_curves_array,
+        model_labels,
+        neural_labels,
+        analysis_parameters,
+        lag_bootstrap_settings,
+        str(plot_path),
+    )
+    autocorr_entry = None
+    simulation_info = metadata.get("simulation") or {}
+    if simulation_info.get("enabled"):
+        if neural_labels:
+            neural_label = neural_labels[0]
+            try:
+                model_idx = model_labels.index(neural_label)
+            except ValueError:
+                model_idx = None
+            if model_idx is not None:
+                rsa_slice = rsa_matrices[0, model_idx]
+                lag_samples = (
+                    lag_curves_array[0, model_idx]
+                    if lag_curves_array is not None
+                    else None
+                )
+                autocorr_entry = {
+                    "label": neural_label,
+                    "rsa_matrix": rsa_slice,
+                    "lag_samples": lag_samples,
+                    "analysis_parameters": analysis_parameters,
+                    "lag_bootstrap_settings": lag_bootstrap_settings,
+                    "output_dir": results_dir,
+                    "order": simulation_info.get("run_index", 0),
+                }
+    return run_id, saved_paths, autocorr_entry
 
 
 def build_analysis_run_id(subject_label, resolution, rsa_method):
@@ -344,82 +582,62 @@ def main():
     if not results_dir.exists():
         raise FileNotFoundError(f"Results directory {results_dir} does not exist.")
 
-    metadata_path = results_dir / f"{analysis_run_id}_metadata.json"
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+    directories: list[tuple[Path, bool, bool]] = []
+    if args.results_dir is not None:
+        directories.append((results_dir, True, True))
+    else:
+        directories.append((results_dir, True, False))
+        simulation_dir = analysis_root / "simulations"
+        if simulation_dir.exists():
+            directories.append((simulation_dir, False, True))
 
-    with metadata_path.open("r") as f:
-        metadata = json.load(f)
+    metadata_jobs: list[tuple[Path, Path]] = []
+    if args.analysis_id:
+        for directory, _, _ in directories:
+            candidate = directory / f"{args.analysis_id}_metadata.json"
+            if candidate.exists():
+                metadata_jobs.append((candidate, directory))
+                break
+        if not metadata_jobs:
+            raise FileNotFoundError(
+                f"Metadata file not found for analysis id '{args.analysis_id}' "
+                f"in directories: {', '.join(str(d[0]) for d in directories)}"
+            )
+    else:
+        for directory, include_base, include_sim in directories:
+            metadata_files = discover_metadata_files(
+                directory, analysis_run_id, include_base, include_sim
+            )
+            metadata_jobs.extend((path, directory) for path in metadata_files)
 
-    outputs = metadata.get("outputs", {})
-
-    def resolve_output_path(
-        key: str, fallback_name: str, require_exists: bool = True
-    ) -> tuple[Path, list[Path]]:
-        stored_path = outputs.get(key)
-        attempts: list[Path] = []
-        if stored_path:
-            candidate = rebase_path_to_known_root(Path(stored_path))
-            if not candidate.is_absolute():
-                candidate = (results_dir / candidate).resolve()
-            attempts.append(candidate)
-            if not require_exists or candidate.exists():
-                return candidate, attempts
-        fallback_path = results_dir / Path(fallback_name)
-        attempts.append(fallback_path)
-        if not require_exists or fallback_path.exists():
-            return fallback_path, attempts
-        return fallback_path, attempts
-
-    rsa_default = f"{analysis_run_id}_dRSA_matrices.npy"
-    rsa_matrices_path, rsa_attempts = resolve_output_path("rsa_matrices", rsa_default)
-    if not rsa_matrices_path.exists():
-        attempted = ", ".join(str(p) for p in rsa_attempts)
+    if not metadata_jobs:
         raise FileNotFoundError(
-            f"RSA matrices file not found after checking: {attempted}"
+            f"No metadata files found for run id '{analysis_run_id}'. "
+            "Ensure C1_dRSA_run.py (with or without --simulation) has produced outputs."
         )
-    rsa_matrices = np.load(rsa_matrices_path)
 
-    lag_default = f"{analysis_run_id}_lag_curves.npy"
-    lag_curves_path, lag_attempts = resolve_output_path("lag_curves", lag_default)
-    lag_curves_array = None
-    if lag_curves_path.exists():
-        lag_curves_array = np.load(lag_curves_path)
-    else:
-        if outputs.get("lag_curves"):
-            attempted = ", ".join(str(p) for p in lag_attempts)
-            print(f"! lag curves file referenced in metadata but missing: {attempted}")
+    autocorr_entries: list[dict] = []
+    for metadata_path, base_dir in metadata_jobs:
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+        run_id, saved_paths, autocorr_entry = plot_run_from_metadata(metadata_path, base_dir)
+        if len(saved_paths) == 1:
+            print(f"✓ {run_id}: saved dRSA plot to {saved_paths[0]}")
         else:
-            print("! lag curves not available; plotting without confidence intervals.")
+            print(f"✓ {run_id}: saved {len(saved_paths)} dRSA plots:")
+            for path in saved_paths:
+                print(f"  - {path}")
+        if autocorr_entry is not None:
+            autocorr_entries.append(autocorr_entry)
 
-    plot_default = f"{analysis_run_id}_plot.png"
-    if outputs.get("plot_target"):
-        plot_path, _ = resolve_output_path("plot_target", plot_default, require_exists=False)
-    elif outputs.get("plot"):
-        plot_path, _ = resolve_output_path("plot", plot_default, require_exists=False)
-    else:
-        plot_path = results_dir / plot_default
-
-    model_labels = metadata["selected_model_labels"]
-    neural_labels = metadata["neural_signal_labels"]
-    analysis_parameters = metadata["analysis_parameters"]
-    lag_bootstrap_settings = metadata.get("lag_bootstrap_settings", {})
-
-    saved_paths = generate_plots(
-        rsa_matrices,
-        lag_curves_array,
-        model_labels,
-        neural_labels,
-        analysis_parameters,
-        lag_bootstrap_settings,
-        str(plot_path),
-    )
-    if len(saved_paths) == 1:
-        print(f"✓ Saved dRSA plot to {saved_paths[0]}")
-    else:
-        print("✓ Saved dRSA plots:")
-        for path in saved_paths:
-            print(f"  - {path}")
+    if autocorr_entries and not args.analysis_id:
+        output_dirs = {Path(entry["output_dir"]) for entry in autocorr_entries}
+        target_dir = next(iter(output_dirs))
+        auto_plot_path = (
+            target_dir / f"{analysis_run_id}_sim_autocorrelations_plot.png"
+        )
+        saved_path = generate_autocorr_summary_plot(autocorr_entries, auto_plot_path)
+        print(f"✓ Simulation autocorrelations: saved to {saved_path}")
 
 
 if __name__ == "__main__":
