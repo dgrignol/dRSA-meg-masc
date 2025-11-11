@@ -2,6 +2,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import sys
 from pathlib import Path
 
 import mne
@@ -13,7 +15,11 @@ from functions.core_functions import (
     save_subsample_diagnostics,
 )
 from functions.PCR_alpha import compute_rsa_matrix_PCR
-from functions.generic_helpers import ensure_analysis_directories, read_repository_root
+from functions.generic_helpers import (
+    ensure_analysis_directories,
+    format_log_timestamp,
+    read_repository_root,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -56,6 +62,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "or treat the onset as the window start."
         ),
     )
+    parser.add_argument(
+        "--simulation",
+        action="store_true",
+        help=(
+            "Replace the neural signal with each model (plus the neural signal itself) in turn and "
+            "run the full dRSA pipeline for every configuration."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -75,11 +89,27 @@ def compute_array_signature(values, dtype):
         return "empty"
     return hashlib.sha1(arr.tobytes(order="C")).hexdigest()
 
+
+def slugify_label(label: str) -> str:
+    """Create a filesystem-friendly suffix from an arbitrary label."""
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")
+    return cleaned or "unnamed"
+
+
+def log(message: str) -> None:
+    """Print ``message`` with a timestamp prefix."""
+    print(f"[{format_log_timestamp()}] {message}")
+
 # CLI + repository root
 args = parse_args()
 
+try:  # ensure logs appear promptly on clusters that buffer stdout heavily
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
+
 if not args.lock_subsample_to_word_onset and args.word_onset_alignment != "center":
-    print(
+    log(
         "Warning: --word-onset-alignment has no effect unless --lock-subsample-to-word-onset is set."
     )
 
@@ -94,9 +124,14 @@ analysis_name, analysis_root, single_subjects_dir, group_level_dir = ensure_anal
 )
 results_root = analysis_root.parent
 
-print(f"Analysis name: {analysis_name}")
-print(f"Analysis directory: {analysis_root}")
-print(f"Subject-level outputs will be written to: {single_subjects_dir}")
+simulations_dir = analysis_root / "simulations"
+simulations_dir.mkdir(parents=True, exist_ok=True)
+
+log(f"Analysis name: {analysis_name}")
+log(f"Analysis directory: {analysis_root}")
+log(f"Subject-level outputs will be written to: {single_subjects_dir}")
+if args.simulation:
+    log(f"Simulation outputs will be written to: {simulations_dir}")
 
 # ===== load data =====
 # paths
@@ -109,7 +144,7 @@ else:
     subject_label = f"sub-{subject:02d}"
 session_label = "all"#"ses-0"
 task_label = "all"#"task-0"
-print(f"subject: {subject}")
+log(f"subject: {subject}")
 
 envelope_path_candidates = [
     os.path.join(
@@ -323,15 +358,15 @@ if gpt_surp_path is not None:
 
 # Report selected models to log
 if model_filter_env:
-    print(f"DRSA_MODELS filter: {model_filter_env}")
+    log(f"DRSA_MODELS filter: {model_filter_env}")
 if selected_models_labels:
-    print("Selected models (label | features | metric | path):")
+    log("Selected models (label | features | metric | path):")
     for mdl, lbl, mtr in zip(selected_models, selected_models_labels, model_rdm_metrics):
         feats = int(np.atleast_2d(mdl).shape[0])
         path = model_paths.get(lbl, "<unknown>")
-        print(f"  - {lbl} | {feats} | {mtr} | {path}")
+        log(f"  - {lbl} | {feats} | {mtr} | {path}")
 else:
-    print("Warning: no models selected after filtering and existence checks.")
+    log("Warning: no models selected after filtering and existence checks.")
 
 
 # ===== settings =====
@@ -354,7 +389,7 @@ if mask_paths:
 
 double_precision = False
 
-lag_bootstrap_iterations = 1000
+lag_bootstrap_iterations = 100
 lag_bootstrap_confidence = 0.95
 lag_bootstrap_random_state = 0
 
@@ -363,18 +398,18 @@ lag_bootstrap_random_state = 0
 
 selected_neural_data = neural_data
 
+neural_rdm_metric = 'correlation'
+
 # Hard-coded neural subsets (currently three identical MEG datasets).
-neural_signal_sets = [
+default_neural_signal_sets = [
     ("MEG Full 1", selected_neural_data),
     ("MEG Full 2", selected_neural_data),
     ("MEG Full 3", selected_neural_data),
 ]
-
-neural_signal_labels = [label for label, _ in neural_signal_sets]
+default_neural_metrics = [neural_rdm_metric for _ in default_neural_signal_sets]
 
 selected_models = [np.atleast_2d(model) for model in selected_models]  # ensure 2D arrays. If 1D, add feature axis.
 
-neural_rdm_metric = 'correlation'
 # model_rdm_metrics already defined during registration; valid options include:
 # euclidean - cosine - hamming - correlation - jaccard
 
@@ -433,7 +468,7 @@ if word_onsets_path is not None:
             raise RuntimeError(
                 f"Failed to load word onset timestamps from {word_onsets_path}: {exc}"
             ) from exc
-        print(f"Warning: failed to load word onset timestamps from {word_onsets_path}: {exc}")
+        log(f"Warning: failed to load word onset timestamps from {word_onsets_path}: {exc}")
     else:
         raw_array = np.asarray(raw_onsets, dtype=np.float64).ravel()
         if raw_array.size:
@@ -456,7 +491,7 @@ if word_onsets_path is not None:
                 f"--lock-subsample-to-word-onset requested but {word_onsets_path} contains no valid entries."
             )
         if not args.lock_subsample_to_word_onset and word_onset_count == 0:
-            print(f"Warning: word onset file {word_onsets_path} contains no valid entries.")
+            log(f"Warning: word onset file {word_onsets_path} contains no valid entries.")
 else:
     word_onset_seconds = None
     word_onset_seconds_signature = "none"
@@ -497,22 +532,22 @@ if word_onset_seconds is not None:
         )
     if word_onset_count:
         if word_onset_invalid_dropped:
-            print(
+            log(
                 f"Loaded {word_onset_count} word onset timestamps (dropped {word_onset_invalid_dropped} invalid entries)."
             )
         else:
-            print(f"Loaded {word_onset_count} word onset timestamps.")
+            log(f"Loaded {word_onset_count} word onset timestamps.")
     if args.lock_subsample_to_word_onset:
-        print(
+        log(
             f"Locking subsample windows to {word_onset_candidate_within_bounds} "
             f"{args.word_onset_alignment}-aligned onset start(s) (allow_overlap={args.allow_overlap})."
         )
         if word_onset_candidate_trimmed > 0:
-            print(
+            log(
                 f"  Ignored {word_onset_candidate_trimmed} onset(s) that cannot fit a {SubSampleDurSec}-s window at {resolution} Hz."
             )
     elif word_onset_candidate_within_bounds:
-        print(
+        log(
             f"Word onsets supply {word_onset_candidate_within_bounds} "
             f"{args.word_onset_alignment}-aligned candidate start(s) at {resolution} Hz."
         )
@@ -539,12 +574,30 @@ analysis_parameters.update(
         ),
     }
 )
-analysis_run_id = f"{subject_label}_res{resolution}_{rsa_computation_method}"
+base_analysis_run_id = f"{subject_label}_res{resolution}_{rsa_computation_method}"
 subject_results_dir = single_subjects_dir
-rsa_matrices_path = subject_results_dir / f"{analysis_run_id}_dRSA_matrices.npy"
-metadata_path = subject_results_dir / f"{analysis_run_id}_metadata.json"
-plot_path = subject_results_dir / f"{analysis_run_id}_plot.png"
-lag_curves_path = subject_results_dir / f"{analysis_run_id}_lag_curves.npy"
+analysis_output_dir = simulations_dir if args.simulation else subject_results_dir
+analysis_output_dir.mkdir(parents=True, exist_ok=True)
+
+if args.simulation:
+    existing_simulations = sorted(
+        analysis_output_dir.glob(f"{base_analysis_run_id}_sim_*_metadata.json")
+    )
+    if existing_simulations:
+        sample_plot = existing_simulations[0].with_name(
+            existing_simulations[0].name.replace("_metadata", "_plot")
+        )
+        log(
+            "Simulations already completed for this subject.\n"
+            f"Inspect existing outputs under: {sample_plot}"
+        )
+        sys.exit(0)
+
+analysis_run_id = base_analysis_run_id
+rsa_matrices_path = analysis_output_dir / f"{analysis_run_id}_dRSA_matrices.npy"
+metadata_path = analysis_output_dir / f"{analysis_run_id}_metadata.json"
+plot_path = analysis_output_dir / f"{analysis_run_id}_plot.png"
+lag_curves_path = analysis_output_dir / f"{analysis_run_id}_lag_curves.npy"
 
 cache_root = subject_results_dir / "cache"
 subsample_cache_dir = cache_root / "subsamples"
@@ -584,7 +637,7 @@ subsample_plot_path = subsample_cache_path.with_suffix(".png")
 
 if subsample_cache_path.exists():
     subsample_indices = np.load(subsample_cache_path)
-    print(f"\u2713 loaded cached subsample indices ({subsample_cache_name})")
+    log(f"\u2713 loaded cached subsample indices ({subsample_cache_name})")
     diagnostics_needed = not subsample_plot_path.exists()
 else:
     subsample_indices = subsampling(
@@ -600,7 +653,7 @@ else:
         allow_overlap=args.allow_overlap,
     )
     np.save(subsample_cache_path, subsample_indices, allow_pickle=False)
-    print(f"\u2713 subsample indices (cached id {subsample_cache_name})")
+    log(f"\u2713 subsample indices (cached id {subsample_cache_name})")
     diagnostics_needed = True
 
 if diagnostics_needed:
@@ -614,84 +667,7 @@ if diagnostics_needed:
             zoom_window_seconds=(30.0, 45.0),
         )
     except Exception as exc:
-        print(f"Warning: failed to create subsample diagnostic plot: {exc}")
-
-rsa_accumulators = np.zeros(
-    (len(neural_signal_sets), len(selected_models), subsample_tps, subsample_tps),
-    dtype=np.float32,
-)
-lag_curves_samples = [[[] for _ in selected_models] for _ in neural_signal_sets]
-
-print("... processing subsamples and computing dRSA")
-iterations_completed = 0
-for iteration_idx, window_indices in enumerate(subsample_indices):
-    iterations_completed = iteration_idx + 1
-
-    neural_rdm_series_per_signal = []
-    for neural_label, neural_data_array in neural_signal_sets:
-        neural_rdm = compute_rdm_series_from_indices(neural_data_array, window_indices, neural_rdm_metric)
-        if not double_precision:
-            neural_rdm = neural_rdm.astype(np.float32, copy=False)
-        neural_rdm_series_per_signal.append(neural_rdm)
-
-    model_rdm_series = []
-    for model_idx, model in enumerate(selected_models):
-        model_rdm = compute_rdm_series_from_indices(model, window_indices, model_rdm_metrics[model_idx])
-        if not double_precision:
-            model_rdm = model_rdm.astype(np.float32, copy=False)
-        model_rdm_series.append(model_rdm)
-
-    for neural_idx, neural_rdm in enumerate(neural_rdm_series_per_signal):
-        for model_idx, model_rdm in enumerate(model_rdm_series):
-            if rsa_computation_method == 'correlation':
-                rsa_matrix_it, lag_curve_it = compute_rsa_matrix_corr(
-                    neural_rdm,
-                    model_rdm,
-                    return_lag_curves=True,
-                    lag_window=adtw_in_tps,
-                )
-                rsa_accumulators[neural_idx, model_idx] += rsa_matrix_it
-                lag_curves_samples[neural_idx][model_idx].append(lag_curve_it.astype(np.float32, copy=False))
-            elif rsa_computation_method == 'PCR':
-                # PCR path requires all iterations; accumulate per iteration for later processing
-                raise NotImplementedError("Streaming PCR computation is not implemented.")
-            else:
-                raise ValueError(f"Unsupported rsa_computation_method: {rsa_computation_method}")
-
-if iterations_completed != subsampling_iterations:
-    raise RuntimeError(
-        f"Expected {subsampling_iterations} iterations, but processed {iterations_completed}."
-    )
-
-rsa_matrices = rsa_accumulators / iterations_completed
-lag_curves_per_signal_model = [
-    [
-        np.stack(curves, axis=0) if curves else None
-        for curves in lag_curve_list
-    ]
-    for lag_curve_list in lag_curves_samples
-]
-
-lag_curves_array = None
-lag_curves_complete = all(
-    all(curves is not None for curves in model_list)
-    for model_list in lag_curves_per_signal_model
-)
-if lag_curves_complete:
-    lag_curves_array = np.stack(
-        [np.stack(model_list, axis=0) for model_list in lag_curves_per_signal_model],
-        axis=0,
-    ).astype(np.float32, copy=False)
-    if save_lag_curves:
-        np.save(lag_curves_path, lag_curves_array)
-
-print("\u2713 compute dRSA matrices")
-
-# saving dRSA matrices:
-if save_rsa_matrices:
-    target_dtype = np.float64 if double_precision else np.float32
-    rsa_matrices_arr = np.asarray(rsa_matrices, dtype=target_dtype)
-    np.save(rsa_matrices_path, rsa_matrices_arr)
+        log(f"Warning: failed to create subsample diagnostic plot: {exc}")
 
 lag_bootstrap_settings = {
     "iterations": lag_bootstrap_iterations,
@@ -699,99 +675,303 @@ lag_bootstrap_settings = {
     "random_state": lag_bootstrap_random_state,
 }
 
-plot_exists = plot_path.exists()
 subsample_plot_exists = subsample_plot_path.exists()
 
-analysis_metadata = {
-    "subject": subject,
-    "subject_label": subject_label,
-    "session_label": session_label,
-    "task_label": task_label,
-    "frequency_band": frequency_band,
-    "lock_subsample_to_word_onset": args.lock_subsample_to_word_onset,
-    "word_onset_alignment": args.word_onset_alignment,
-    "allow_overlap": args.allow_overlap,
-    "meg_path": str(MEG_path),
-    "model_paths": model_paths,
-    "mask_paths": mask_paths,
-    "rsa_computation_method": rsa_computation_method,
-    "neural_rdm_metric": neural_rdm_metric,
-    "model_rdm_metrics": model_rdm_metrics,
-    "double_precision": double_precision,
-    "save_rsa_matrices": save_rsa_matrices,
-    "save_lag_curves": save_lag_curves,
-    "analysis_parameters": analysis_parameters,
-    "lag_bootstrap_settings": lag_bootstrap_settings,
-    "selected_model_labels": selected_models_labels,
-    "neural_signal_labels": neural_signal_labels,
-    "analysis_name": analysis_name,
-    "word_onsets": {
-        "expected_path": str(word_onsets_expected_path),
-        "resolved_path": str(word_onsets_path) if word_onsets_path else None,
-        "count": word_onset_count if word_onset_seconds is not None else None,
-        "seconds_signature": word_onset_seconds_signature,
-        "candidate_total": word_onset_candidate_total if word_onset_seconds is not None else None,
-        "candidate_within_bounds": word_onset_candidate_within_bounds if word_onset_seconds is not None else None,
-        "candidate_trimmed_for_window": (
-            word_onset_candidate_trimmed if word_onset_seconds is not None else None
-        ),
-        "candidate_signature": word_onset_candidate_signature,
-        "invalid_entries_dropped": (
-            word_onset_invalid_dropped if word_onset_seconds is not None else None
-        ),
-        "loading_error": word_onset_loading_error,
-        "sampling_rate_hz": resolution,
-        "subsample_window_seconds": SubSampleDurSec,
-        "lock_subsample_to_word_onset": args.lock_subsample_to_word_onset,
-        "alignment": args.word_onset_alignment if word_onset_seconds is not None else None,
-        "allow_overlap": args.allow_overlap,
-    },
-    "analysis_paths": {
-        "results_root": str(results_root),
-        "analysis_root": str(analysis_root),
-        "single_subjects": str(single_subjects_dir),
-        "group_level": str(group_level_dir),
-        "subject_results_dir": str(subject_results_dir),
-        "concatenation_metadata": str(concatenation_metadata_path),
-    },
-    "subsample_cache": {
-        "id": subsample_cache_name,
-        "path": str(subsample_cache_path),
-        "plot": str(subsample_plot_path),
-        "plot_exists": subsample_plot_exists,
-        "lock_subsample_to_word_onset": args.lock_subsample_to_word_onset,
-        "word_onset_alignment": (
-            args.word_onset_alignment if args.lock_subsample_to_word_onset else None
-        ),
-        "allow_overlap": args.allow_overlap,
-        "word_onset_signature": cache_onset_signature,
-        "word_onset_seconds_signature": word_onset_seconds_signature,
-        "word_onset_candidate_count": (
-            word_onset_candidate_within_bounds if word_onset_seconds is not None else None
-        ),
-        "word_onset_candidate_trimmed": (
-            word_onset_candidate_trimmed if word_onset_seconds is not None else None
-        ),
-    },
-    "rsa_matrix_shape": list(rsa_matrices.shape),
-    "lag_curves_shape": (
-        list(lag_curves_array.shape) if lag_curves_array is not None else None
-    ),
-    "outputs": {
-        "rsa_matrices": str(rsa_matrices_path) if save_rsa_matrices else None,
-        "lag_curves": (
-            str(lag_curves_path)
-            if save_lag_curves and lag_curves_array is not None
-            else None
-        ),
-        "plot": str(plot_path) if plot_exists else None,
-        "plot_target": str(plot_path),
-        "cache_root": str(cache_root),
-        "metadata": str(metadata_path),
-        "subsample_diagnostics": str(subsample_plot_path) if subsample_plot_exists else None,
-        "subsample_diagnostics_target": str(subsample_plot_path),
-    },
-}
 
-with open(metadata_path, "w") as f:
-    json.dump(analysis_metadata, f, indent=2)
+def execute_drsa_run(
+    run_suffix: str | None,
+    neural_signal_sets: list[tuple[str, np.ndarray]],
+    neural_metrics: list[str],
+    model_arrays: list[np.ndarray],
+    model_labels: list[str],
+    model_metrics: list[str],
+    simulation_info: dict | None,
+) -> dict:
+    """Execute the dRSA pipeline for a specific neural/model configuration."""
+    run_suffix_clean = run_suffix or "default"
+    analysis_run_id = base_analysis_run_id
+    if run_suffix:
+        analysis_run_id = f"{analysis_run_id}_{run_suffix_clean}"
+    rsa_matrices_path = analysis_output_dir / f"{analysis_run_id}_dRSA_matrices.npy"
+    metadata_path = analysis_output_dir / f"{analysis_run_id}_metadata.json"
+    plot_path = analysis_output_dir / f"{analysis_run_id}_plot.png"
+    lag_curves_path = analysis_output_dir / f"{analysis_run_id}_lag_curves.npy"
+
+    if len(neural_signal_sets) != len(neural_metrics):
+        raise ValueError(
+            f"neural_metrics length mismatch: {len(neural_metrics)} metrics for "
+            f"{len(neural_signal_sets)} neural signals."
+        )
+
+    rsa_accumulators = np.zeros(
+        (len(neural_signal_sets), len(model_arrays), subsample_tps, subsample_tps),
+        dtype=np.float32,
+    )
+    lag_curves_samples = [[[] for _ in model_arrays] for _ in neural_signal_sets]
+
+    log(f"... processing subsamples and computing dRSA (run: {run_suffix_clean})")
+    iterations_completed = 0
+    for iteration_idx, window_indices in enumerate(subsample_indices):
+        iterations_completed = iteration_idx + 1
+
+        neural_rdm_series_per_signal = []
+        for (_, neural_data_array), neural_metric in zip(neural_signal_sets, neural_metrics):
+            neural_rdm = compute_rdm_series_from_indices(
+                neural_data_array, window_indices, neural_metric
+            )
+            if not double_precision:
+                neural_rdm = neural_rdm.astype(np.float32, copy=False)
+            neural_rdm_series_per_signal.append(neural_rdm)
+
+        model_rdm_series = []
+        for model_idx, model in enumerate(model_arrays):
+            model_rdm = compute_rdm_series_from_indices(
+                model, window_indices, model_metrics[model_idx]
+            )
+            if not double_precision:
+                model_rdm = model_rdm.astype(np.float32, copy=False)
+            model_rdm_series.append(model_rdm)
+
+        for neural_idx, neural_rdm in enumerate(neural_rdm_series_per_signal):
+            for model_idx, model_rdm in enumerate(model_rdm_series):
+                if rsa_computation_method == "correlation":
+                    rsa_matrix_it, lag_curve_it = compute_rsa_matrix_corr(
+                        neural_rdm,
+                        model_rdm,
+                        return_lag_curves=True,
+                        lag_window=adtw_in_tps,
+                    )
+                    rsa_accumulators[neural_idx, model_idx] += rsa_matrix_it
+                    lag_curves_samples[neural_idx][model_idx].append(
+                        lag_curve_it.astype(np.float32, copy=False)
+                    )
+                elif rsa_computation_method == "PCR":
+                    raise NotImplementedError("Streaming PCR computation is not implemented.")
+                else:
+                    raise ValueError(f"Unsupported rsa_computation_method: {rsa_computation_method}")
+
+    if iterations_completed != subsampling_iterations:
+        raise RuntimeError(
+            f"Expected {subsampling_iterations} iterations, but processed {iterations_completed}."
+        )
+
+    rsa_matrices = rsa_accumulators / iterations_completed
+    lag_curves_per_signal_model = [
+        [np.stack(curves, axis=0) if curves else None for curves in lag_curve_list]
+        for lag_curve_list in lag_curves_samples
+    ]
+
+    lag_curves_array = None
+    lag_curves_complete = all(
+        all(curves is not None for curves in model_list)
+        for model_list in lag_curves_per_signal_model
+    )
+    if lag_curves_complete:
+        lag_curves_array = np.stack(
+            [np.stack(model_list, axis=0) for model_list in lag_curves_per_signal_model],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        if save_lag_curves:
+            np.save(lag_curves_path, lag_curves_array)
+
+    log("✓ compute dRSA matrices")
+
+    if save_rsa_matrices:
+        target_dtype = np.float64 if double_precision else np.float32
+        rsa_matrices_arr = np.asarray(rsa_matrices, dtype=target_dtype)
+        np.save(rsa_matrices_path, rsa_matrices_arr)
+
+    plot_exists = plot_path.exists()
+
+    analysis_metadata = {
+        "subject": subject,
+        "subject_label": subject_label,
+        "session_label": session_label,
+        "task_label": task_label,
+        "frequency_band": frequency_band,
+        "lock_subsample_to_word_onset": args.lock_subsample_to_word_onset,
+        "word_onset_alignment": args.word_onset_alignment,
+        "allow_overlap": args.allow_overlap,
+        "meg_path": str(MEG_path),
+        "model_paths": model_paths,
+        "mask_paths": mask_paths,
+        "rsa_computation_method": rsa_computation_method,
+        "neural_rdm_metric": neural_rdm_metric,
+        "neural_signal_metrics": neural_metrics,
+        "model_rdm_metrics": model_metrics,
+        "double_precision": double_precision,
+        "save_rsa_matrices": save_rsa_matrices,
+        "save_lag_curves": save_lag_curves,
+        "analysis_parameters": analysis_parameters,
+        "lag_bootstrap_settings": lag_bootstrap_settings,
+        "selected_model_labels": model_labels,
+        "neural_signal_labels": [label for label, _ in neural_signal_sets],
+        "analysis_name": analysis_name,
+        "analysis_run_id": analysis_run_id,
+        "simulation": simulation_info,
+        "word_onsets": {
+            "expected_path": str(word_onsets_expected_path),
+            "resolved_path": str(word_onsets_path) if word_onsets_path else None,
+            "count": word_onset_count if word_onset_seconds is not None else None,
+            "seconds_signature": word_onset_seconds_signature,
+            "candidate_total": (
+                word_onset_candidate_total if word_onset_seconds is not None else None
+            ),
+            "candidate_within_bounds": (
+                word_onset_candidate_within_bounds if word_onset_seconds is not None else None
+            ),
+            "candidate_trimmed_for_window": (
+                word_onset_candidate_trimmed if word_onset_seconds is not None else None
+            ),
+            "candidate_signature": word_onset_candidate_signature,
+            "invalid_entries_dropped": (
+                word_onset_invalid_dropped if word_onset_seconds is not None else None
+            ),
+            "loading_error": word_onset_loading_error,
+            "sampling_rate_hz": resolution,
+            "subsample_window_seconds": SubSampleDurSec,
+            "lock_subsample_to_word_onset": args.lock_subsample_to_word_onset,
+            "alignment": args.word_onset_alignment if word_onset_seconds is not None else None,
+            "allow_overlap": args.allow_overlap,
+        },
+        "analysis_paths": {
+            "results_root": str(results_root),
+            "analysis_root": str(analysis_root),
+            "single_subjects": str(single_subjects_dir),
+            "simulations": str(simulations_dir),
+            "group_level": str(group_level_dir),
+            "subject_results_dir": str(analysis_output_dir),
+            "standard_results_dir": str(subject_results_dir),
+            "concatenation_metadata": str(concatenation_metadata_path),
+        },
+        "subsample_cache": {
+            "id": subsample_cache_name,
+            "path": str(subsample_cache_path),
+            "plot": str(subsample_plot_path),
+            "plot_exists": subsample_plot_exists,
+            "lock_subsample_to_word_onset": args.lock_subsample_to_word_onset,
+            "word_onset_alignment": (
+                args.word_onset_alignment if args.lock_subsample_to_word_onset else None
+            ),
+            "allow_overlap": args.allow_overlap,
+            "word_onset_signature": cache_onset_signature,
+            "word_onset_seconds_signature": word_onset_seconds_signature,
+            "word_onset_candidate_count": (
+                word_onset_candidate_within_bounds if word_onset_seconds is not None else None
+            ),
+            "word_onset_candidate_trimmed": (
+                word_onset_candidate_trimmed if word_onset_seconds is not None else None
+            ),
+        },
+        "rsa_matrix_shape": list(rsa_matrices.shape),
+        "lag_curves_shape": (
+            list(lag_curves_array.shape) if lag_curves_array is not None else None
+        ),
+        "outputs": {
+            "rsa_matrices": str(rsa_matrices_path) if save_rsa_matrices else None,
+            "lag_curves": (
+                str(lag_curves_path)
+                if save_lag_curves and lag_curves_array is not None
+                else None
+            ),
+            "plot": str(plot_path) if plot_exists else None,
+            "plot_target": str(plot_path),
+            "output_dir": str(analysis_output_dir),
+            "cache_root": str(cache_root),
+            "metadata": str(metadata_path),
+            "subsample_diagnostics": (
+                str(subsample_plot_path) if subsample_plot_exists else None
+            ),
+            "subsample_diagnostics_target": str(subsample_plot_path),
+        },
+    }
+
+    with open(metadata_path, "w") as f:
+        json.dump(analysis_metadata, f, indent=2)
+
+    return {
+        "analysis_run_id": analysis_run_id,
+        "metadata_path": metadata_path,
+        "rsa_matrices_path": rsa_matrices_path if save_rsa_matrices else None,
+        "lag_curves_path": (
+            lag_curves_path if save_lag_curves and lag_curves_array is not None else None
+        ),
+        "plot_path": plot_path,
+    }
+
+
+if args.simulation:
+    neural_reference_label = f"{subject_label} Neural"
+    neural_reference_array = np.atleast_2d(selected_neural_data)
+
+    simulation_targets = [
+        {
+            "label": neural_reference_label,
+            "neural_tuple": (neural_reference_label, selected_neural_data),
+            "neural_metric": neural_rdm_metric,
+            "origin": "neural",
+            "model_arrays": [neural_reference_array],
+            "model_labels": [neural_reference_label],
+            "model_metrics": [neural_rdm_metric],
+            "models_include_neural_signal": False,
+        }
+    ]
+    for label, model, metric in zip(
+        selected_models_labels, selected_models, model_rdm_metrics
+    ):
+        simulation_targets.append(
+            {
+                "label": label,
+                "neural_tuple": (label, model),
+                "neural_metric": metric,
+                "origin": "model",
+                "model_arrays": selected_models,
+                "model_labels": selected_models_labels,
+                "model_metrics": model_rdm_metrics,
+                "models_include_neural_signal": False,
+            }
+        )
+    total_runs = len(simulation_targets)
+
+    for run_idx, target in enumerate(simulation_targets):
+        neural_label = target["label"]
+        run_suffix = f"sim_{run_idx:02d}_{slugify_label(neural_label)}"
+        neural_signal_sets = [target["neural_tuple"]]
+        neural_metrics = [target["neural_metric"]]
+        simulation_info = {
+            "enabled": True,
+            "run_index": run_idx,
+            "total_runs": total_runs,
+            "neural_source_label": neural_label,
+            "neural_source_origin": target["origin"],
+            "models_include_neural_signal": target["models_include_neural_signal"],
+            "neural_metric": target["neural_metric"],
+            "output_dir": str(analysis_output_dir),
+        }
+        artifacts = execute_drsa_run(
+            run_suffix,
+            neural_signal_sets,
+            neural_metrics,
+            target["model_arrays"],
+            target["model_labels"],
+            target["model_metrics"],
+            simulation_info,
+        )
+        log(
+            f"✓ simulation run {run_idx + 1}/{total_runs} completed "
+            f"({neural_label}) → {artifacts['analysis_run_id']}"
+        )
+else:
+    artifacts = execute_drsa_run(
+        None,
+        default_neural_signal_sets,
+        default_neural_metrics,
+        selected_models,
+        selected_models_labels,
+        model_rdm_metrics,
+        {"enabled": False, "output_dir": str(analysis_output_dir)},
+    )
+    log(
+        f"✓ dRSA run completed → {artifacts['analysis_run_id']} "
+        f"(metadata: {artifacts['metadata_path']})"
+    )

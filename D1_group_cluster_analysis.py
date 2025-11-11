@@ -45,6 +45,7 @@ from scipy.stats import ttest_rel, t
 from functions.generic_helpers import (
     ensure_analysis_directories,
     find_latest_analysis_directory,
+    format_log_timestamp,
     read_repository_root,
 )
 
@@ -53,6 +54,11 @@ LOGGER = logging.getLogger(__name__)
 
 # Fixed seed for permutation sign choices (exposed in captions/settings for reproducibility)
 PERMUTATION_SEED = 0
+# Cluster permutation configuration is fixed in this implementation: we run a two-tailed
+# test and consider both positive and negative clusters when comparing lag curves/matrices.
+CLUSTER_PERMUTATION_TAIL = "two-tailed"
+CLUSTER_PERMUTATION_SIGN_SCOPE = "positive_and_negative"
+CLUSTER_PERMUTATION_TAIL_DESCRIPTION = "two-tailed (positive and negative clusters)"
 
 
 def parse_args() -> argparse.Namespace:
@@ -568,6 +574,8 @@ def _format_analysis_caption(
         if key in observed_keys:
             continue
         caption_items.append((key, value))
+    if not any(key == "timestamp" for key, _ in caption_items):
+        caption_items.append(("timestamp", format_log_timestamp()))
     if not caption_items:
         return None
     caption = ", ".join(f"{key}={value}" for key, value in caption_items)
@@ -1086,10 +1094,11 @@ def main() -> int:
         except TypeError:
             analysis_parameters_template = {}
 
+    permutation_alpha_caption_value = f"{args.permutation_alpha} ({CLUSTER_PERMUTATION_TAIL_DESCRIPTION})"
     base_caption_entries: List[Tuple[str, Any]] = [
         ("lag_metric", args.lag_metric),
         ("cluster_alpha", args.cluster_alpha),
-        ("permutation_alpha", args.permutation_alpha),
+        ("permutation_alpha", permutation_alpha_caption_value),
         ("n_permutations", args.n_permutations),
         ("permutation_seed", PERMUTATION_SEED),
         ("n_subjects", len(subjects)),
@@ -1181,6 +1190,8 @@ def main() -> int:
             "permutation_alpha": args.permutation_alpha,
             "n_permutations": args.n_permutations,
             "permutation_seed": PERMUTATION_SEED,
+            "permutation_tail": CLUSTER_PERMUTATION_TAIL,
+            "permutation_cluster_signs": CLUSTER_PERMUTATION_SIGN_SCOPE,
             "lag_metric": args.lag_metric,
             "output_path": str(output_path_neural),
             "vector_output_path": str(vector_output_neural),
