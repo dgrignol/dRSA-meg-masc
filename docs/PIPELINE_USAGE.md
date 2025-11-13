@@ -125,7 +125,7 @@ Builds subject-level GloVe embedding trajectories on a 100 Hz grid.
   ```
 
 ### C1_dRSA_run.py
-Runs the subject-level dynamic RSA analysis.
+Runs the subject-level dynamic RSA analysis. In addition to the legacy streaming correlation metric, the Python implementation now supports PCR, Ridge, Lasso, and Elastic Net regression for estimating each model’s unique variance. Non-correlation modes cache the full neural/model RDM stacks (in RAM or via memmaps, depending on `--regression-mem-threshold-gb`) and log PCA usage/R² summaries for long cluster jobs.
 
 - **Input**: Concatenated MEG, masks, and all model trajectories (envelope, word frequency, voicing, GloVe).
 - **Output** per subject:
@@ -139,7 +139,18 @@ Runs the subject-level dynamic RSA analysis.
   - `--lock-subsample-to-word-onset` – restrict subsample starts to the concatenated word onset timestamps (requires the numpy file written by A2).
   - `--word-onset-alignment {center,start}` – when locking, center windows on each onset (default) or start them at the onset to reproduce the legacy behavior.
   - `--allow-overlap` – allow subsample windows to overlap (handy when the onset density is low; compatible with and without locking).
+  - `--regression-method {correlation,pcr,ridge,lasso,elasticnet}` – choose the model–neural fitting strategy (default: `elasticnet`, which isolates each model’s unique contribution by regularised multi-model regression). Set `correlation` to stream the classic Pearson metric without storing full RDM stacks.
+  - `--regression-alpha` – regularisation strength for Ridge/Lasso/Elastic Net (default 1.0). Tweak per subject or pass different values via the pipeline wrapper’s `EXTRA_ARGS`.
+  - `--regression-l1-ratio` – Elastic Net mixing parameter between L1 (1.0) and L2 (0.0); ignored by other methods.
+  - `--pcr-variance-threshold` – cumulative variance PCs must explain when `--regression-method=pcr` (default 0.85).
+  - `--regression-border-threshold` – lag-autocorrelation threshold (default 0.1) used to drop same-model predictors near zero lag, matching the MATLAB `dRSA_border.m` logic.
+  - `--regression-mem-threshold-gb` – per-buffer size limit (default 2 GiB) above which the intermediate RDM stacks spill to disk via memmaps. Set this higher on machines with ample RAM to keep everything in memory; leave as-is on shared clusters.
+  - `--plot-regression-borders/--no-plot-regression-borders` – save (default) or skip PNG diagnostics of each model’s autocorrelation with the derived regression borders overlaid. Files land under `results/<analysis_name>/single_subjects/cache/regression_borders/`.
+  - `--progress-log-every N` – stream a status message every N subsampling iterations while buffering/regressing (default 10). Handy when monitoring long cluster jobs.
+  - `--progress-neural-step N` – during the regression phase, log after every N neural time points per iteration (default 50). Lower values provide finer-grained updates at the cost of chattier logs.
   - `--simulation` – reuse the cached subsamples but swap the neural input: (1) run MEG×MEG once (neural autocorrelation only) and (2) run each model as the “neural” source against the full model set. Outputs land in `results/<analysis_name>/simulations/`. If that folder already contains the `_sim_*` metadata for the requested subject, the script exits immediately and prints where to find the existing plots instead of recomputing. (The skip is all-or-nothing: as soon as one simulation metadata file exists for the subject, the loop is bypassed. Delete or move the previous simulation outputs if you need to regenerate them.)
+
+> **Per-model regression borders:** you can set different autocorrelation thresholds per model directly in `C1_dRSA_run.py` by passing the optional `regression_border=<value>` argument to `_register_model(...)`. The helper signature is `_register_model(path, label, metric, regression_border=None)`. When omitted, the global `--regression-border-threshold` applies; when provided, that specific model’s border plot and regression exclusion mask use the supplied value (e.g., `0.05` for a wider window, `0.2` for a tighter one).
 - **Usage**
   ```bash
   # Preferred: explicit analysis name reused across scripts
@@ -195,6 +206,7 @@ Aggregates subject dRSA results, performs a cluster-based permutation test, and 
   - `--results-root PATH` – parent directory containing analyses (default `results`).
   - `--subjects`, `--models`, `--lag-metric`, `--cluster-alpha`, `--permutation-alpha`, `--n-permutations` – unchanged.
   - `--force-matrix-clusters` – force matrix-level cluster permutation even when subsamples are not word-onset locked (auto-enabled when metadata reports `lock_subsample_to_word_onset=True`).
+  - `--skip-matrix-clusters` – bypass matrix-level permutation tests even if they would normally run (useful for quick smoke checks or when only lag curves are needed).
   - `--matrix-downsample-factor INT` – average matrices over INT×INT blocks before the permutation test (default 1, i.e. no downsampling).
   - `--results-dir` – legacy override pointing directly to subject-level outputs.
 - **Usage**
@@ -221,7 +233,8 @@ Aggregates subject dRSA results, performs a cluster-based permutation test, and 
 
 - **Matrix-level cluster analysis**
   - When subject metadata indicates `lock_subsample_to_word_onset=True`, the script performs 2D cluster permutation tests on the group dRSA matrices in addition to the lag curves. Significant matrix clusters are outlined in white on the heatmaps and stored in the `.npz` cache.
-  - Use `--force-matrix-clusters` to run the matrix permutation even if the metadata shows unlocked subsamples (default off). The `--n-permutations` value applies to both lag and matrix tests.
+  - Use `--force-matrix-clusters` to run the matrix permutation even if the metadata shows unlocked subsamples (default off). The `--skip-matrix-clusters` flag does the opposite by disabling the matrix test altogether, regardless of the metadata.
+  - The `--n-permutations` value applies to both lag and matrix tests.
   - `--matrix-downsample-factor` reduces matrix resolution before cluster testing (e.g., `--matrix-downsample-factor 2` averages 2×2 blocks for ~75% faster permutations; `--matrix-downsample-factor 4` averages 4×4 blocks for ~94% faster permutations; larger factors scale roughly with 1/factor²). The resulting significant blocks are projected back onto the full-resolution heatmap for plotting.
   - Matrix permutation results are cached alongside the usual averages so replotting with `--plot-only` reproduces the overlays without recomputation.
 - **Logging**
@@ -619,3 +632,4 @@ Run a lightweight C1 analysis that only includes the GPT models and locks subsam
   - Use the same `--word-onset-alignment start` suffix here if you prefer start-aligned windows.
 
 Happy analysing!
+- **Border QC helper**: after a run completes, use `python check_regr_boarder.py <analysis_name>` to overlay custom thresholds (edited directly inside `check_regr_boarder.py`) on top of the cached autocorrelation curves saved in `single_subjects/cache/regression_borders/`. The script loads the `.npz` data exported alongside each PNG, recomputes the border for the scripted thresholds, and writes comparison plots to `inspect_borders_*` folders. Pass `--metadata path/to/_metadata.json` when an analysis contains multiple subject runs, and optionally override the default threshold via `--default-threshold`.
