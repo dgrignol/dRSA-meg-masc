@@ -138,6 +138,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "when --simulation is not provided."
         ),
     )
+    parser.add_argument(
+        "--simulation-meg-like-noise",
+        action="store_true",
+        help=(
+            "Generate MEG-like surrogate simulations that preserve structural properties of the "
+            "neural data but are expected to produce no dRSA effects."
+        ),
+    )
+    parser.add_argument(
+        "--subsample-index-shuffle",
+        action="store_true",
+        help=(
+            "When used with --simulation-meg-like-noise, shuffles the subsample window order for "
+            "the neural data only, breaking alignment with the models while preserving window "
+            "locking and coverage."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -222,6 +239,16 @@ def allocate_rdm_buffer(
         path = None
     return RDMSeriesBuffer(label=label, array=array, path=path, bytes_allocated=bytes_needed)
 
+
+def generate_subsample_permutations(iterations: int, n_subsamples: int, seed: int) -> np.ndarray:
+    """Create one permutation per iteration for shuffling subsample order."""
+    rng = np.random.default_rng(seed)
+    permutations = np.empty((iterations, n_subsamples), dtype=np.int64)
+    base = np.arange(n_subsamples, dtype=np.int64)
+    for idx in range(iterations):
+        permutations[idx] = rng.permutation(base)
+    return permutations
+
 # CLI + repository root
 args = parse_args()
 
@@ -233,6 +260,14 @@ if args.progress_log_every <= 0:
     raise ValueError("--progress-log-every must be a positive integer.")
 if args.progress_neural_step <= 0:
     raise ValueError("--progress-neural-step must be a positive integer.")
+if args.subsample_index_shuffle and not args.simulation_meg_like_noise:
+    raise ValueError("--subsample-index-shuffle requires --simulation-meg-like-noise.")
+meg_like_modes_requested = args.subsample_index_shuffle
+if args.simulation_meg_like_noise and not meg_like_modes_requested:
+    raise ValueError(
+        "--simulation-meg-like-noise currently requires at least one mode flag "
+        "(e.g., --subsample-index-shuffle)."
+    )
 
 try:  # ensure logs appear promptly on clusters that buffer stdout heavily
     sys.stdout.reconfigure(line_buffering=True)
@@ -262,6 +297,8 @@ log(f"Analysis name: {analysis_name}")
 log(f"Analysis directory: {analysis_root}")
 log(f"Subject-level outputs will be written to: {single_subjects_dir}")
 if args.simulation or args.simulation_noise:
+    log(f"Simulation outputs will be written to: {simulations_dir}")
+elif args.simulation_meg_like_noise:
     log(f"Simulation outputs will be written to: {simulations_dir}")
 
 # ===== load data =====
@@ -626,6 +663,10 @@ analysis_parameters = {
     "plot_regression_borders": args.plot_regression_borders,
     "progress_log_every": args.progress_log_every,
     "progress_neural_step": args.progress_neural_step,
+    "simulation": args.simulation,
+    "simulation_noise": args.simulation_noise,
+    "simulation_meg_like_noise": args.simulation_meg_like_noise,
+    "subsample_index_shuffle": args.subsample_index_shuffle,
 }
 
 if word_onsets_path is not None:
@@ -745,7 +786,7 @@ analysis_parameters.update(
 )
 base_analysis_run_id = f"{subject_label}_res{resolution}_{rsa_computation_method}"
 subject_results_dir = single_subjects_dir
-run_simulations = args.simulation or args.simulation_noise
+run_simulations = args.simulation or args.simulation_noise or args.simulation_meg_like_noise
 analysis_output_dir = simulations_dir if run_simulations else subject_results_dir
 analysis_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -857,6 +898,7 @@ def execute_drsa_run(
     model_labels: list[str],
     model_metrics: list[str],
     simulation_info: dict | None,
+    neural_subsample_permutations: np.ndarray | None = None,
 ) -> dict:
     """Execute the dRSA pipeline for a specific neural/model configuration."""
     run_suffix_clean = run_suffix or "default"
@@ -958,10 +1000,22 @@ def execute_drsa_run(
         for iteration_idx, window_indices in enumerate(subsample_indices):
             iterations_completed = iteration_idx + 1
 
+            permutation_indices = None
+            if neural_subsample_permutations is not None:
+                permutation_indices = neural_subsample_permutations[iteration_idx]
+                if permutation_indices.shape[0] != window_indices.shape[0]:
+                    raise ValueError(
+                        "Permutation length does not match number of subsamples "
+                        f"({permutation_indices.shape[0]} vs {window_indices.shape[0]})."
+                    )
+            neural_window_indices = (
+                window_indices if permutation_indices is None else window_indices[permutation_indices]
+            )
+
             neural_rdm_series_per_signal = []
             for (_, neural_data_array), neural_metric in zip(neural_signal_sets, neural_metrics):
                 neural_rdm = compute_rdm_series_from_indices(
-                    neural_data_array, window_indices, neural_metric
+                    neural_data_array, neural_window_indices, neural_metric
                 )
                 if not double_precision:
                     neural_rdm = neural_rdm.astype(np.float32, copy=False)
@@ -1311,6 +1365,37 @@ if args.simulation_noise:
             }
         )
 
+if args.simulation_meg_like_noise:
+    if subsampling_random_state is not None:
+        meg_like_seed_source = ("subsampling_state", subsampling_random_state, subject, subject_label)
+    else:
+        meg_like_seed_source = ("analysis_id", analysis_run_id, subject, subject_label)
+
+    if args.subsample_index_shuffle:
+        shuffle_seed = hash((meg_like_seed_source, "subsample_index_shuffle")) & 0x7FFFFFFF
+        shuffle_permutations = generate_subsample_permutations(
+            subsampling_iterations,
+            n_subsamples,
+            shuffle_seed,
+        )
+        shuffle_label = "MEG-Like Subsample Shuffle"
+        simulation_targets.append(
+            {
+                "label": shuffle_label,
+                "neural_tuple": (shuffle_label, selected_neural_data),
+                "neural_metric": neural_rdm_metric,
+                "origin": "meg_like",
+                "model_arrays": selected_models,
+                "model_labels": selected_models_labels,
+                "model_metrics": model_rdm_metrics,
+                "models_include_neural_signal": False,
+                "noise_seed": None,
+                "meg_like_mode": "subsample_index_shuffle",
+                "neural_subsample_permutations": shuffle_permutations,
+                "neural_subsample_permutation_seed": shuffle_seed,
+            }
+        )
+
 if simulation_targets:
     total_runs = len(simulation_targets)
     for run_idx, target in enumerate(simulation_targets):
@@ -1328,6 +1413,8 @@ if simulation_targets:
             "neural_metric": target["neural_metric"],
             "output_dir": str(analysis_output_dir),
             "noise_seed": target.get("noise_seed"),
+            "meg_like_mode": target.get("meg_like_mode"),
+            "neural_subsample_permutation_seed": target.get("neural_subsample_permutation_seed"),
         }
         artifacts = execute_drsa_run(
             run_suffix,
@@ -1337,6 +1424,7 @@ if simulation_targets:
             target["model_labels"],
             target["model_metrics"],
             simulation_info,
+            neural_subsample_permutations=target.get("neural_subsample_permutations"),
         )
         log(
             f"✓ simulation run {run_idx + 1}/{total_runs} completed "

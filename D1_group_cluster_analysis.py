@@ -189,6 +189,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--simulation-origin",
+        default=None,
+        help=(
+            "Override the required simulation origin recorded in metadata "
+            "(default: 'synthetic' when --simulation-noise is provided)."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="DEBUG",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -898,7 +906,10 @@ def main() -> int:
     analysis_name = args.analysis_name
 
     simulation_label = args.simulation_neural_label if args.simulation_noise else None
-    simulation_origin_filter = "synthetic" if args.simulation_noise else None
+    if args.simulation_noise:
+        simulation_origin_filter = args.simulation_origin or "synthetic"
+    else:
+        simulation_origin_filter = None
 
     if args.results_dir is not None:
         results_dir = args.results_dir
@@ -1305,6 +1316,8 @@ def main() -> int:
         analysis_settings["simulation_mode"] = args.simulation_noise
         if args.simulation_noise:
             analysis_settings["simulation_neural_label"] = args.simulation_neural_label
+            if simulation_origin_filter:
+                analysis_settings["simulation_origin"] = simulation_origin_filter
         analysis_settings["analysis_caption"] = analysis_caption
         analysis_settings["analysis_parameters"] = analysis_parameters_template
         if results_dir_mode == "analysis" and analysis_root is not None:
