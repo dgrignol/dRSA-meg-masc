@@ -173,6 +173,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--simulation-noise",
+        action="store_true",
+        help=(
+            "Use simulation outputs stored under <analysis>/simulations instead of single-subject "
+            "results. When enabled, the script filters for synthetic noise runs."
+        ),
+    )
+    parser.add_argument(
+        "--simulation-neural-label",
+        default="Random Noise 208",
+        help=(
+            "Simulation neural source label to load when --simulation-noise is set "
+            "(e.g., 'Random Noise 208' or 'Random Noise 1')."
+        ),
+    )
+    parser.add_argument(
+        "--simulation-origin",
+        default=None,
+        help=(
+            "Override the required simulation origin recorded in metadata "
+            "(default: 'synthetic' when --simulation-noise is provided)."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="DEBUG",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -192,7 +216,11 @@ def load_subject_data(
     models: Sequence[str],
     results_dir: Path,
     lag_metric: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    *,
+    use_simulation_runs: bool = False,
+    simulation_label: Optional[str] = None,
+    simulation_origin_filter: Optional[str] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Load per-subject dRSA matrices and derive the model-specific lag curves.
 
@@ -207,11 +235,27 @@ def load_subject_data(
     lag_metric:
         RSA filename prefix indicating the similarity metric (e.g., "correlation").
 
+    Parameters
+    ----------
+    subject : str
+        Two-digit subject identifier (e.g., "01").
+    models : Sequence[str]
+        Ordered model labels to extract.
+    results_dir : Path
+        Directory containing subject outputs (single_subjects or simulations).
+    lag_metric : str
+        Metric tag embedded in filenames (e.g., "correlation").
+    use_simulation_runs : bool, optional
+        When True, search for simulation outputs (files with `_sim_*` suffix).
+    simulation_label : str, optional
+        Neural source label recorded in the simulation metadata to select.
+    simulation_origin_filter : str, optional
+        Require the simulation metadata's `neural_source_origin` to match this string.
+
     Returns
     -------
-    Tuple[np.ndarray, np.ndarray, np.ndarray]
-        The subset of dRSA matrices for the requested models, their lag curves,
-        and the metadata dictionary parsed from disk.
+    Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        The subset of dRSA matrices, their lag curves, metadata, and the lag-axis in TPs.
     """
     subject_id = int(subject)
     prefix_candidates = [
@@ -221,14 +265,57 @@ def load_subject_data(
 
     matrices_path: Optional[Path] = None
     meta_path: Optional[Path] = None
+    metadata: Optional[Dict[str, Any]] = None
 
-    for prefix in prefix_candidates:
-        candidate_matrix = results_dir / f"{prefix}_dRSA_matrices.npy"
-        candidate_meta = results_dir / f"{prefix}_metadata.json"
-        if candidate_matrix.exists() and candidate_meta.exists():
-            matrices_path = candidate_matrix
-            meta_path = candidate_meta
-            break
+    if use_simulation_runs:
+        candidate_pairs: List[Tuple[Path, Dict[str, Any]]] = []
+        for prefix in prefix_candidates:
+            pattern = f"{prefix}_sim_*_metadata.json"
+            for candidate_meta in sorted(results_dir.glob(pattern)):
+                try:
+                    candidate_metadata = json.loads(candidate_meta.read_text())
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Failed to parse metadata {candidate_meta}") from exc
+                sim_info = candidate_metadata.get("simulation") or {}
+                if not sim_info.get("enabled", False):
+                    continue
+                if simulation_origin_filter and sim_info.get("neural_source_origin") != simulation_origin_filter:
+                    continue
+                if simulation_label and sim_info.get("neural_source_label") != simulation_label:
+                    continue
+                candidate_pairs.append((candidate_meta, candidate_metadata))
+        if not candidate_pairs:
+            label_msg = f" with label '{simulation_label}'" if simulation_label else ""
+            origin_msg = (
+                f" and origin '{simulation_origin_filter}'" if simulation_origin_filter else ""
+            )
+            raise FileNotFoundError(
+                f"No simulation outputs{label_msg}{origin_msg} found for subject {subject} in {results_dir}."
+            )
+        if simulation_label is None and len(candidate_pairs) > 1:
+            labels_available = ", ".join(
+                (pair[1].get("simulation", {}) or {}).get("neural_source_label", pair[0].stem)
+                for pair in candidate_pairs
+            )
+            raise ValueError(
+                "Multiple simulation runs found; specify --simulation-neural-label. "
+                f"Available labels: {labels_available}"
+            )
+        meta_path, metadata = candidate_pairs[0]
+        base_stem = meta_path.stem.replace("_metadata", "")
+        matrices_path = meta_path.with_name(f"{base_stem}_dRSA_matrices.npy")
+        if not matrices_path.exists():
+            raise FileNotFoundError(
+                f"Simulation matrices missing for {meta_path.name}: expected {matrices_path.name}"
+            )
+    else:
+        for prefix in prefix_candidates:
+            candidate_matrix = results_dir / f"{prefix}_dRSA_matrices.npy"
+            candidate_meta = results_dir / f"{prefix}_metadata.json"
+            if candidate_matrix.exists() and candidate_meta.exists():
+                matrices_path = candidate_matrix
+                meta_path = candidate_meta
+                break
 
     if matrices_path is None or meta_path is None:
         expected = ", ".join(prefix_candidates)
@@ -238,7 +325,8 @@ def load_subject_data(
         )
 
     matrices = np.load(matrices_path)
-    metadata = json.loads(meta_path.read_text())
+    if metadata is None:
+        metadata = json.loads(meta_path.read_text())
 
     labels = metadata.get("selected_model_labels")
     if labels is None:
@@ -817,6 +905,12 @@ def main() -> int:
     results_dir_mode = "analysis"
     analysis_name = args.analysis_name
 
+    simulation_label = args.simulation_neural_label if args.simulation_noise else None
+    if args.simulation_noise:
+        simulation_origin_filter = args.simulation_origin or "synthetic"
+    else:
+        simulation_origin_filter = None
+
     if args.results_dir is not None:
         results_dir = args.results_dir
         if not results_dir.is_absolute():
@@ -853,8 +947,20 @@ def main() -> int:
             ) = ensure_analysis_directories(results_root, latest_root.name)
         results_dir = single_subjects_dir
         LOGGER.info("Using analysis '%s' located at %s.", analysis_name, analysis_root)
-        LOGGER.info("Subject-level inputs: %s", results_dir)
+        if args.simulation_noise:
+            simulation_dir = analysis_root / "simulations"
+            results_dir = simulation_dir
+            LOGGER.info(
+                "Simulation-noise mode enabled — sourcing inputs from: %s", results_dir
+            )
+        else:
+            LOGGER.info("Subject-level inputs: %s", results_dir)
         LOGGER.info("Group-level output directory: %s", group_level_dir)
+
+    if args.simulation_noise and results_dir_mode == "legacy":
+        LOGGER.warning(
+            "--simulation-noise requested with --results-dir; ensure the directory points to simulation outputs."
+        )
 
     if not results_dir.exists():
         raise FileNotFoundError(f"Results directory {results_dir} does not exist.")
@@ -1031,6 +1137,9 @@ def main() -> int:
             args.models,
             results_dir,
             args.lag_metric,
+            use_simulation_runs=args.simulation_noise,
+            simulation_label=simulation_label if args.simulation_noise else None,
+            simulation_origin_filter=simulation_origin_filter if args.simulation_noise else None,
         )
         subject_data.append((matrices, lag_curves, metadata))
         if lag_axis_reference is None:
@@ -1107,6 +1216,8 @@ def main() -> int:
         ("matrix_cluster_analysis", run_matrix_clusters),
         ("matrix_downsample_factor", matrix_downsample_factor),
     ]
+    if args.simulation_noise:
+        base_caption_entries.append(("simulation_neural_label", args.simulation_neural_label))
 
     resolution = metadata_template["analysis_parameters"]["resolution_hz"]
     lags_sec = lag_axis_reference / resolution
@@ -1201,12 +1312,19 @@ def main() -> int:
             "matrix_cluster_analysis": run_matrix_clusters,
             "matrix_downsample_factor": matrix_downsample_factor,
         }
+        analysis_settings["input_dir"] = str(results_dir)
+        analysis_settings["simulation_mode"] = args.simulation_noise
+        if args.simulation_noise:
+            analysis_settings["simulation_neural_label"] = args.simulation_neural_label
+            if simulation_origin_filter:
+                analysis_settings["simulation_origin"] = simulation_origin_filter
         analysis_settings["analysis_caption"] = analysis_caption
         analysis_settings["analysis_parameters"] = analysis_parameters_template
         if results_dir_mode == "analysis" and analysis_root is not None:
             analysis_settings["analysis_name"] = analysis_name
             analysis_settings["analysis_root"] = str(analysis_root)
-            analysis_settings["single_subjects_dir"] = str(results_dir)
+            analysis_settings["single_subjects_dir"] = str(single_subjects_dir)
+            analysis_settings["simulations_dir"] = str(analysis_root / "simulations")
             if group_level_dir is not None:
                 analysis_settings["group_level_dir"] = str(group_level_dir)
         np.savez_compressed(

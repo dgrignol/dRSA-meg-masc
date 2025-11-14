@@ -149,6 +149,9 @@ Runs the subject-level dynamic RSA analysis. In addition to the legacy streaming
   - `--progress-log-every N` – stream a status message every N subsampling iterations while buffering/regressing (default 10). Handy when monitoring long cluster jobs.
   - `--progress-neural-step N` – during the regression phase, log after every N neural time points per iteration (default 50). Lower values provide finer-grained updates at the cost of chattier logs.
   - `--simulation` – reuse the cached subsamples but swap the neural input: (1) run MEG×MEG once (neural autocorrelation only) and (2) run each model as the “neural” source against the full model set. Outputs land in `results/<analysis_name>/simulations/`. If that folder already contains the `_sim_*` metadata for the requested subject, the script exits immediately and prints where to find the existing plots instead of recomputing. (The skip is all-or-nothing: as soon as one simulation metadata file exists for the subject, the loop is bypassed. Delete or move the previous simulation outputs if you need to regenerate them.)
+  - `--simulation-noise` – always append synthetic random-noise runs (white noise across 208 channels plus a 1-channel average) even when `--simulation` is not supplied. The metadata for these runs advertises `neural_source_label` `"Random Noise 208"` / `"Random Noise 1"` with origin `"synthetic"` so D1 can target them later.
+  - `--simulation-meg-like-noise` – request MEG-like surrogate simulations that preserve the original windowing/masking but should not yield dRSA structure. Each surrogate is activated via an additional flag (see below) so you can mix and match techniques without rewriting the script.
+  - `--subsample-index-shuffle` – first MEG-like mode: for every iteration, shuffle only the neural subsample order while leaving the model RDMs untouched, thereby locking windows to the same onset grid but destroying neural/model correspondence. Must be combined with `--simulation-meg-like-noise`.
 
 > **Per-model regression borders:** you can set different autocorrelation thresholds per model directly in `C1_dRSA_run.py` by passing the optional `regression_border=<value>` argument to `_register_model(...)`. The helper signature is `_register_model(path, label, metric, regression_border=None)`. When omitted, the global `--regression-border-threshold` applies; when provided, that specific model’s border plot and regression exclusion mask use the supplied value (e.g., `0.05` for a wider window, `0.2` for a tighter one).
 - **Usage**
@@ -162,7 +165,14 @@ Runs the subject-level dynamic RSA analysis. In addition to the legacy streaming
   # Simulation sweep for subject 01 (reuses subsamples, writes to results/<analysis>/simulations/)
   python C1_dRSA_run.py sub-01 --analysis-name center_on_onset_overlap \
     --lock-subsample-to-word-onset --allow-overlap --simulation
+
+  # MEG-like surrogate: shuffle the neural subsample order while keeping model RDMs fixed
+  python C1_dRSA_run.py sub-01 --analysis-name center_on_onset_overlap \
+    --lock-subsample-to-word-onset --allow-overlap \
+    --regression-method correlation \
+    --simulation-meg-like-noise --subsample-index-shuffle
   ```
+- **MEG-like simulation outputs**: Every MEG-like mode produces its own `_sim_*` run under `results/<analysis_name>/simulations/`. Each entry records `simulation.neural_source_label` (e.g., `MEG-Like Subsample Shuffle`) plus an origin code (`meg_like`) so D1 can target the relevant surrogate later. Because the same subsample cache is reused, these runs complete quickly and remain comparable to the original analysis.
 - **Word onset workflows**: When `derivatives/preprocessed/<subject>/concatenated/<subject>_concatenated_word_onsets_sec.npy` exists, C1 hashes the timestamps for caching, records their provenance inside the metadata JSON, and overlays them on the subsampling QC figure. Passing `--lock-subsample-to-word-onset` enforces that every subsample window is anchored to a word onset; the window is centered on the onset by default, and `--word-onset-alignment start` reproduces the legacy start-aligned behavior. Toggling `--lock-subsample-to-word-onset`, `--word-onset-alignment`, or `--allow-overlap` automatically invalidates the subsample cache so reruns remain reproducible.
 - **Tuning**: Edit the constants near the bottom of the file (e.g., `averaging_diagonal_time_window_sec`, `n_subsamples`) to adjust the analysis.
 
@@ -196,7 +206,7 @@ Recreates subject-level dRSA figures from cached matrices and lag curves using t
 ### D1_group_cluster_analysis.py
 Aggregates subject dRSA results, performs a cluster-based permutation test, and generates summary figures.
 
-- **Input**: Subject-level outputs from C1 located in `results/<analysis_name>/single_subjects/`.
+- **Input**: Subject-level outputs from C1 located in `results/<analysis_name>/single_subjects/` (or `results/<analysis_name>/simulations/` when `--simulation-noise` is set).
 - **Output** (one set per neural signal reported in the metadata) written to `results/<analysis_name>/group_level/`:
   - `group_dRSA_summary_<NEURAL_LABEL>.png` (raster, 300 dpi)
   - `group_dRSA_summary_<NEURAL_LABEL>.pdf` (vector export for Illustrator)
@@ -209,6 +219,9 @@ Aggregates subject dRSA results, performs a cluster-based permutation test, and 
   - `--skip-matrix-clusters` – bypass matrix-level permutation tests even if they would normally run (useful for quick smoke checks or when only lag curves are needed).
   - `--matrix-downsample-factor INT` – average matrices over INT×INT blocks before the permutation test (default 1, i.e. no downsampling).
   - `--results-dir` – legacy override pointing directly to subject-level outputs.
+  - `--simulation-noise` – read subject inputs from `results/<analysis_name>/simulations/` instead of `single_subjects/`, filtering for simulation runs whose metadata advertises `simulation.enabled=True`.
+  - `--simulation-neural-label` – label recorded in the simulation metadata (`simulation.neural_source_label`) to select when `--simulation-noise` is enabled (default `"Random Noise 208"`).
+  - `--simulation-origin` – override the metadata origin filter applied in simulation mode (default `"synthetic"` unless explicitly set). Use `"meg_like"` for the surrogate shuffles created via `--simulation-meg-like-noise`.
 - **Usage**
   ```bash
   # Preferred: explicit analysis
@@ -226,10 +239,21 @@ Aggregates subject dRSA results, performs a cluster-based permutation test, and 
     --subjects $(seq -w 1 27) \
     --models "Envelope" "GloVe" \
     --force-matrix-clusters
+
+  # Analyse the MEG-like subsample-shuffle surrogate
+  python D1_group_cluster_analysis.py \
+    --analysis-name center_on_onset_overlap \
+    --subjects $(seq -w 1 27) \
+    --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm" "GPT Next-Token" "GPT Surprisal" \
+    --simulation-noise \
+    --simulation-neural-label "MEG-Like Subsample Shuffle" \
+    --simulation-origin meg_like \
+    --skip-matrix-clusters
   ```
 
   The `<NEURAL_LABEL>` suffix is derived from `metadata["neural_signal_labels"]` for the first subject. Spaces are converted to underscores (e.g., `MEG Full 1 → MEG_Full_1`). The figure title also includes the full label, so expect separate outputs such as `Group-level dRSA summary | MEG Full 2`. If only a single neural signal is present, the suffix still uses the label to keep filenames explicit.
   When using multiple neural signals, rerun the `--plot-only` command with each cache file produced during the initial analysis.
+  When `--simulation-noise` is active, the loader only inspects simulation outputs stored under `results/<analysis>/simulations/` and filters them by the provided label/origin tuple. This matches the metadata emitted by C1 for both pure-noise (`simulation_origin=synthetic`) and MEG-like (`simulation_origin=meg_like`) surrogates.
 
 - **Matrix-level cluster analysis**
   - When subject metadata indicates `lock_subsample_to_word_onset=True`, the script performs 2D cluster permutation tests on the group dRSA matrices in addition to the lag curves. Significant matrix clusters are outlined in white on the heatmaps and stored in the `.npz` cache.
