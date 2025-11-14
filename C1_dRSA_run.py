@@ -130,6 +130,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "run the full dRSA pipeline for every configuration."
         ),
     )
+    parser.add_argument(
+        "--simulation-noise",
+        action="store_true",
+        help=(
+            "Generate synthetic random-noise simulations (neural signal replaced by noise) even "
+            "when --simulation is not provided."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -253,7 +261,7 @@ simulations_dir.mkdir(parents=True, exist_ok=True)
 log(f"Analysis name: {analysis_name}")
 log(f"Analysis directory: {analysis_root}")
 log(f"Subject-level outputs will be written to: {single_subjects_dir}")
-if args.simulation:
+if args.simulation or args.simulation_noise:
     log(f"Simulation outputs will be written to: {simulations_dir}")
 
 # ===== load data =====
@@ -737,10 +745,11 @@ analysis_parameters.update(
 )
 base_analysis_run_id = f"{subject_label}_res{resolution}_{rsa_computation_method}"
 subject_results_dir = single_subjects_dir
-analysis_output_dir = simulations_dir if args.simulation else subject_results_dir
+run_simulations = args.simulation or args.simulation_noise
+analysis_output_dir = simulations_dir if run_simulations else subject_results_dir
 analysis_output_dir.mkdir(parents=True, exist_ok=True)
 
-if args.simulation:
+if args.simulation and not args.simulation_noise:
     existing_simulations = sorted(
         analysis_output_dir.glob(f"{base_analysis_run_id}_sim_*_metadata.json")
     )
@@ -1236,11 +1245,12 @@ def execute_drsa_run(
         "plot_path": plot_path,
     }
 
+simulation_targets: list[dict] = []
+
 if args.simulation:
     neural_reference_label = f"{subject_label} Neural"
     neural_reference_array = np.atleast_2d(selected_neural_data)
-
-    simulation_targets = [
+    simulation_targets.append(
         {
             "label": neural_reference_label,
             "neural_tuple": (neural_reference_label, selected_neural_data),
@@ -1250,8 +1260,9 @@ if args.simulation:
             "model_labels": [neural_reference_label],
             "model_metrics": [neural_rdm_metric],
             "models_include_neural_signal": False,
+            "noise_seed": None,
         }
-    ]
+    )
     for label, model, metric in zip(
         selected_models_labels, selected_models, model_rdm_metrics
     ):
@@ -1265,10 +1276,43 @@ if args.simulation:
                 "model_labels": selected_models_labels,
                 "model_metrics": model_rdm_metrics,
                 "models_include_neural_signal": False,
+                "noise_seed": None,
             }
         )
-    total_runs = len(simulation_targets)
 
+if args.simulation_noise:
+    if subsampling_random_state is not None:
+        noise_seed_source = ("subsampling_state", subsampling_random_state, subject, subject_label)
+    else:
+        noise_seed_source = ("analysis_id", analysis_run_id, subject, subject_label)
+    noise_seed = hash((noise_seed_source, "simulation_noise")) & 0x7FFFFFFF
+    noise_rng = np.random.default_rng(noise_seed)
+    noise_multi = noise_rng.standard_normal((208, selected_neural_data.shape[1]))
+    noise_single = noise_multi.mean(axis=0, keepdims=True)
+    random_noise_models = [
+        {"label": "Random Noise 208", "data": noise_multi, "metric": "correlation"},
+        {"label": "Random Noise 1", "data": noise_single, "metric": "euclidean"},
+    ]
+    for noise_model in random_noise_models:
+        combined_model_arrays = selected_models + [noise_model["data"]]
+        combined_model_labels = selected_models_labels + [noise_model["label"]]
+        combined_model_metrics = model_rdm_metrics + [noise_model["metric"]]
+        simulation_targets.append(
+            {
+                "label": noise_model["label"],
+                "neural_tuple": (noise_model["label"], noise_model["data"]),
+                "neural_metric": noise_model["metric"],
+                "origin": "synthetic",
+                "model_arrays": combined_model_arrays,
+                "model_labels": combined_model_labels,
+                "model_metrics": combined_model_metrics,
+                "models_include_neural_signal": False,
+                "noise_seed": noise_seed,
+            }
+        )
+
+if simulation_targets:
+    total_runs = len(simulation_targets)
     for run_idx, target in enumerate(simulation_targets):
         neural_label = target["label"]
         run_suffix = f"sim_{run_idx:02d}_{slugify_label(neural_label)}"
@@ -1283,6 +1327,7 @@ if args.simulation:
             "models_include_neural_signal": target["models_include_neural_signal"],
             "neural_metric": target["neural_metric"],
             "output_dir": str(analysis_output_dir),
+            "noise_seed": target.get("noise_seed"),
         }
         artifacts = execute_drsa_run(
             run_suffix,
