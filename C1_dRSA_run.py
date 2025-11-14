@@ -4,22 +4,25 @@ import json
 import os
 import re
 import sys
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from argparse import BooleanOptionalAction
 
-import mne
 import numpy as np
 from functions.core_functions import (
     subsampling,
+    compute_lag_correlation,
     compute_rsa_matrix_corr,
     compute_rdm_series_from_indices,
     save_subsample_diagnostics,
 )
-from functions.PCR_alpha import compute_rsa_matrix_PCR
 from functions.generic_helpers import (
     ensure_analysis_directories,
     format_log_timestamp,
     read_repository_root,
 )
+from functions.regression_methods import RegressionConfig, compute_dRSA_regression
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -63,6 +66,63 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--regression-method",
+        choices=("correlation", "pcr", "ridge", "lasso", "elasticnet"),
+        default="elasticnet",
+        help="Model–neural regression method (default: elasticnet).",
+    )
+    parser.add_argument(
+        "--regression-alpha",
+        type=float,
+        default=1.0,
+        help="Regularization strength for Ridge/Lasso/Elastic Net (ignored for correlation/PCR).",
+    )
+    parser.add_argument(
+        "--regression-l1-ratio",
+        type=float,
+        default=0.5,
+        help="Elastic Net mixing parameter between L1=1.0 and L2=0.0 penalties.",
+    )
+    parser.add_argument(
+        "--pcr-variance-threshold",
+        type=float,
+        default=0.85,
+        help="Fraction of variance PCs must explain in PCR mode.",
+    )
+    parser.add_argument(
+        "--regression-border-threshold",
+        type=float,
+        default=0.1,
+        help="Lag-autocorrelation threshold for excluding self-model predictors.",
+    )
+    parser.add_argument(
+        "--regression-mem-threshold-gb",
+        type=float,
+        default=2.0,
+        help="Per-buffer size (GiB) above which regression RDM stacks use on-disk memmaps.",
+    )
+    parser.add_argument(
+        "--plot-regression-borders",
+        action=BooleanOptionalAction,
+        default=True,
+        help=(
+            "Write per-model autocorrelation plots with regression borders overlaid "
+            "(default: enabled; disable with --no-plot-regression-borders)."
+        ),
+    )
+    parser.add_argument(
+        "--progress-log-every",
+        type=int,
+        default=10,
+        help="Log buffering/regression progress every N iterations (default: 10).",
+    )
+    parser.add_argument(
+        "--progress-neural-step",
+        type=int,
+        default=50,
+        help="During regression, log after every N neural time points per iteration (default: 50).",
+    )
+    parser.add_argument(
         "--simulation",
         action="store_true",
         help=(
@@ -100,8 +160,71 @@ def log(message: str) -> None:
     """Print ``message`` with a timestamp prefix."""
     print(f"[{format_log_timestamp()}] {message}")
 
+
+@dataclass
+class RDMSeriesBuffer:
+    """Container for an RDM time-series stack, optionally backed by a memmap."""
+
+    label: str
+    array: np.ndarray
+    path: Path | None
+    bytes_allocated: int
+
+    def is_memmap(self) -> bool:
+        return isinstance(self.array, np.memmap)
+
+    def flush(self) -> None:
+        if self.is_memmap():
+            self.array.flush()
+
+    def cleanup(self) -> None:
+        if self.is_memmap():
+            self.array.flush()
+            mmap_obj = getattr(self.array, "_mmap", None)
+            if mmap_obj is not None:
+                mmap_obj.close()
+            if self.path:
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+        self.array = None
+        self.path = None
+
+
+def allocate_rdm_buffer(
+    label: str,
+    shape: tuple[int, ...],
+    dtype,
+    mem_threshold_bytes: int,
+    tmp_dir: Path,
+) -> RDMSeriesBuffer:
+    """Allocate an RDM buffer either in RAM or via an on-disk memmap."""
+
+    entries = int(np.prod(shape, dtype=np.int64))
+    bytes_needed = entries * np.dtype(dtype).itemsize
+    use_memmap = bytes_needed >= mem_threshold_bytes
+    if use_memmap:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        filename = tmp_dir / f"{slugify_label(label)}_{uuid.uuid4().hex}.dat"
+        array = np.memmap(filename, mode="w+", dtype=dtype, shape=shape)
+        path = filename
+    else:
+        array = np.empty(shape, dtype=dtype)
+        path = None
+    return RDMSeriesBuffer(label=label, array=array, path=path, bytes_allocated=bytes_needed)
+
 # CLI + repository root
 args = parse_args()
+
+if not 0.0 <= args.regression_l1_ratio <= 1.0:
+    raise ValueError("--regression-l1-ratio must be within [0, 1].")
+if args.regression_mem_threshold_gb <= 0:
+    raise ValueError("--regression-mem-threshold-gb must be positive.")
+if args.progress_log_every <= 0:
+    raise ValueError("--progress-log-every must be a positive integer.")
+if args.progress_neural_step <= 0:
+    raise ValueError("--progress-neural-step must be a positive integer.")
 
 try:  # ensure logs appear promptly on clusters that buffer stdout heavily
     sys.stdout.reconfigure(line_buffering=True)
@@ -289,6 +412,7 @@ model_paths = {}
 selected_models = []
 selected_models_labels = []
 model_rdm_metrics = []
+model_regression_borders = {}
 
 model_filter_env = os.getenv("DRSA_MODELS")
 if model_filter_env:
@@ -299,7 +423,21 @@ else:
     model_filter = None
 
 
-def _register_model(path, label, metric):
+def _register_model(path, label, metric, regression_border=None):
+    """Register a model RDM source.
+
+    Parameters
+    ----------
+    path : str
+        Filesystem path to the numpy array (features × timepoints).
+    label : str
+        Human-readable name used in metadata/plots.
+    metric : str
+        Distance metric used when building model RDMs (passed to `pdist`).
+    regression_border : float, optional
+        Per-model autocorrelation threshold for regression border estimation.
+        Defaults to the global --regression-border-threshold when omitted.
+    """
     if model_filter and label.lower() not in model_filter:
         return
     if not os.path.exists(path):
@@ -315,12 +453,23 @@ def _register_model(path, label, metric):
     selected_models_labels.append(label)
     model_rdm_metrics.append(metric)
     model_paths[label] = path
+    if regression_border is None:
+        regression_border = args.regression_border_threshold
+    model_regression_borders[label] = float(regression_border)
 
-_register_model(envelope_path, "Envelope", "euclidean")
-_register_model(voicing_path, "Phoneme Voicing", "euclidean")
-_register_model(wordfreq_path, "Word Frequency", "euclidean")
-_register_model(glove_path, "GloVe", "correlation")
-_register_model(glove_norm_path, "GloVe Norm", "euclidean")
+
+def _resolve_model_borders(model_labels):
+    """Return per-model border thresholds aligned with `model_labels`."""
+    return [
+        model_regression_borders.get(lbl, args.regression_border_threshold)
+        for lbl in model_labels
+    ]
+# 0.05 0.1 0.1 0.3 0.1 0.05 0.2
+_register_model(envelope_path, "Envelope", "euclidean", regression_border=0.05)
+_register_model(voicing_path, "Phoneme Voicing", "euclidean", regression_border=0.05)
+_register_model(wordfreq_path, "Word Frequency", "euclidean", regression_border=0.2)
+_register_model(glove_path, "GloVe", "correlation", regression_border=0.1)
+_register_model(glove_norm_path, "GloVe Norm", "euclidean", regression_border=0.1)
 
 # Optional GPT next-token models
 gpt_next_path_candidates = [
@@ -336,7 +485,7 @@ gpt_next_path_candidates = [
 ]
 gpt_next_path = next((p for p in gpt_next_path_candidates if os.path.exists(p)), None)
 if gpt_next_path is not None:
-    _register_model(gpt_next_path, "GPT Next-Token", "correlation")
+    _register_model(gpt_next_path, "GPT Next-Token", "correlation", regression_border=0.25)
 
 # Predictability is currently disabled by request; enable via DRSA_MODELS filter if needed.
 
@@ -353,7 +502,7 @@ gpt_surp_path_candidates = [
 ]
 gpt_surp_path = next((p for p in gpt_surp_path_candidates if os.path.exists(p)), None)
 if gpt_surp_path is not None:
-    _register_model(gpt_surp_path, "GPT Surprisal", "euclidean")
+    _register_model(gpt_surp_path, "GPT Surprisal", "euclidean", regression_border=0.1)
 
 
 # Report selected models to log
@@ -403,8 +552,8 @@ neural_rdm_metric = 'correlation'
 # Hard-coded neural subsets (currently three identical MEG datasets).
 default_neural_signal_sets = [
     ("MEG Full 1", selected_neural_data),
-    ("MEG Full 2", selected_neural_data),
-    ("MEG Full 3", selected_neural_data),
+#    ("MEG Full 2", selected_neural_data), # this is just a placeholder for now, disabled to reduce runtime
+#    ("MEG Full 3", selected_neural_data), # this is just a placeholder for now, disabled to reduce runtime
 ]
 default_neural_metrics = [neural_rdm_metric for _ in default_neural_signal_sets]
 
@@ -413,8 +562,8 @@ selected_models = [np.atleast_2d(model) for model in selected_models]  # ensure 
 # model_rdm_metrics already defined during registration; valid options include:
 # euclidean - cosine - hamming - correlation - jaccard
 
-rsa_computation_method = 'correlation'
-# accepts: correlation - PCR
+rsa_computation_method = args.regression_method.lower()
+log(f"Regression method set to: {rsa_computation_method}")
 
 # check if lengths match
 if not (len(selected_models) == len(selected_models_labels) == len(model_rdm_metrics)):
@@ -428,21 +577,22 @@ if not (len(selected_models) == len(selected_models_labels) == len(model_rdm_met
 
 # ===== set parameters =====
 
-n_subsamples = 150
-subsampling_iterations = 100
+n_subsamples = 70 # e.g. 150 seconds
+subsampling_iterations = 80 # e.g. 100 seconds
 
-SubSampleDurSec = 5
-averaging_diagonal_time_window_sec = 3
+SubSampleDurSec = 5 # e.g. 5 seconds
+averaging_diagonal_time_window_sec = 3 # e.g. 3 seconds
 
 resolution = 100 # in Hz - change as needed
 
 tps = selected_neural_data.shape[1]
 adtw_in_tps = averaging_diagonal_time_window_sec * resolution
 # this is to avoid noisy diagonal averaging in the dRSA matrix edges
-# and also, not to use the models outside the -3 +3 window for the PCR.
+# and also, not to use the models outside the e.g. -3 +3 window for the PCR.
 subsample_tps = SubSampleDurSec * resolution # subsample size in tps - also number of RDMs calculated for each subsample
 
 subsampling_random_state = None
+rdm_length = n_subsamples * (n_subsamples - 1) // 2
 
 analysis_parameters = {
     "n_subsamples": n_subsamples,
@@ -453,10 +603,21 @@ analysis_parameters = {
     "tps": tps,
     "averaging_window_tps": adtw_in_tps,
     "subsample_tps": subsample_tps,
+    "rdm_length": rdm_length,
     "subsampling_random_state": subsampling_random_state,
     "word_onset_alignment": (
         args.word_onset_alignment if args.lock_subsample_to_word_onset else None
     ),
+    "regression_method": rsa_computation_method,
+    "regression_alpha": args.regression_alpha,
+    "regression_l1_ratio": args.regression_l1_ratio,
+    "pcr_variance_threshold": args.pcr_variance_threshold,
+    "regression_border_threshold": args.regression_border_threshold,
+    "regression_border_per_model": model_regression_borders,
+    "regression_mem_threshold_gb": args.regression_mem_threshold_gb,
+    "plot_regression_borders": args.plot_regression_borders,
+    "progress_log_every": args.progress_log_every,
+    "progress_neural_step": args.progress_neural_step,
 }
 
 if word_onsets_path is not None:
@@ -678,6 +839,7 @@ lag_bootstrap_settings = {
 subsample_plot_exists = subsample_plot_path.exists()
 
 
+
 def execute_drsa_run(
     run_suffix: str | None,
     neural_signal_sets: list[tuple[str, np.ndarray]],
@@ -702,86 +864,260 @@ def execute_drsa_run(
             f"neural_metrics length mismatch: {len(neural_metrics)} metrics for "
             f"{len(neural_signal_sets)} neural signals."
         )
+    model_border_thresholds = _resolve_model_borders(model_labels)
 
-    rsa_accumulators = np.zeros(
-        (len(neural_signal_sets), len(model_arrays), subsample_tps, subsample_tps),
-        dtype=np.float32,
-    )
-    lag_curves_samples = [[[] for _ in model_arrays] for _ in neural_signal_sets]
-
-    log(f"... processing subsamples and computing dRSA (run: {run_suffix_clean})")
-    iterations_completed = 0
-    for iteration_idx, window_indices in enumerate(subsample_indices):
-        iterations_completed = iteration_idx + 1
-
-        neural_rdm_series_per_signal = []
-        for (_, neural_data_array), neural_metric in zip(neural_signal_sets, neural_metrics):
-            neural_rdm = compute_rdm_series_from_indices(
-                neural_data_array, window_indices, neural_metric
-            )
-            if not double_precision:
-                neural_rdm = neural_rdm.astype(np.float32, copy=False)
-            neural_rdm_series_per_signal.append(neural_rdm)
-
-        model_rdm_series = []
-        for model_idx, model in enumerate(model_arrays):
-            model_rdm = compute_rdm_series_from_indices(
-                model, window_indices, model_metrics[model_idx]
-            )
-            if not double_precision:
-                model_rdm = model_rdm.astype(np.float32, copy=False)
-            model_rdm_series.append(model_rdm)
-
-        for neural_idx, neural_rdm in enumerate(neural_rdm_series_per_signal):
-            for model_idx, model_rdm in enumerate(model_rdm_series):
-                if rsa_computation_method == "correlation":
-                    rsa_matrix_it, lag_curve_it = compute_rsa_matrix_corr(
-                        neural_rdm,
-                        model_rdm,
-                        return_lag_curves=True,
-                        lag_window=adtw_in_tps,
-                    )
-                    rsa_accumulators[neural_idx, model_idx] += rsa_matrix_it
-                    lag_curves_samples[neural_idx][model_idx].append(
-                        lag_curve_it.astype(np.float32, copy=False)
-                    )
-                elif rsa_computation_method == "PCR":
-                    raise NotImplementedError("Streaming PCR computation is not implemented.")
-                else:
-                    raise ValueError(f"Unsupported rsa_computation_method: {rsa_computation_method}")
-
-    if iterations_completed != subsampling_iterations:
-        raise RuntimeError(
-            f"Expected {subsampling_iterations} iterations, but processed {iterations_completed}."
-        )
-
-    rsa_matrices = rsa_accumulators / iterations_completed
-    lag_curves_per_signal_model = [
-        [np.stack(curves, axis=0) if curves else None for curves in lag_curve_list]
-        for lag_curve_list in lag_curves_samples
-    ]
-
+    use_regression = rsa_computation_method != "correlation"
+    target_dtype = np.float64 if double_precision else np.float32
+    mem_threshold_bytes = int(args.regression_mem_threshold_gb * (1024 ** 3))
+    regression_tmp_dir = cache_root / "regression_tmp"
+    regression_border_dir = cache_root / "regression_borders"
+    regression_buffers: list[RDMSeriesBuffer] = []
+    regression_buffer_info: list[dict] | None = [] if use_regression else None
+    regression_stats_summary: list[dict] = []
+    regression_r2 = None
+    neural_buffers: list[RDMSeriesBuffer] = []
+    model_buffers: list[RDMSeriesBuffer] = []
+    rsa_accumulators = None
+    lag_curves_samples = None
     lag_curves_array = None
-    lag_curves_complete = all(
-        all(curves is not None for curves in model_list)
-        for model_list in lag_curves_per_signal_model
-    )
-    if lag_curves_complete:
-        lag_curves_array = np.stack(
-            [np.stack(model_list, axis=0) for model_list in lag_curves_per_signal_model],
-            axis=0,
-        ).astype(np.float32, copy=False)
-        if save_lag_curves:
-            np.save(lag_curves_path, lag_curves_array)
+
+    if use_regression:
+        buffer_shape = (subsampling_iterations, subsample_tps, rdm_length)
+        series_bytes = (
+            buffer_shape[0] * buffer_shape[1] * rdm_length * np.dtype(target_dtype).itemsize
+        )
+        approx_gb = series_bytes / (1024 ** 3)
+        log(
+            f"[{rsa_computation_method}] caching RDM stacks "
+            f"({buffer_shape[0]} iters × {buffer_shape[1]} TPs × {rdm_length} distances ≈ {approx_gb:.2f} GiB per stack)"
+        )
+        for label, _ in neural_signal_sets:
+            buf = allocate_rdm_buffer(
+                f"neural_{label}",
+                buffer_shape,
+                target_dtype,
+                mem_threshold_bytes,
+                regression_tmp_dir,
+            )
+            neural_buffers.append(buf)
+            regression_buffers.append(buf)
+            regression_buffer_info.append(
+                {
+                    "label": label,
+                    "role": "neural",
+                    "gigabytes": round(buf.bytes_allocated / (1024 ** 3), 3),
+                    "storage": "disk" if buf.path else "ram",
+                    "path": str(buf.path) if buf.path else None,
+                }
+            )
+        for label in model_labels:
+            buf = allocate_rdm_buffer(
+                f"model_{label}",
+                buffer_shape,
+                target_dtype,
+                mem_threshold_bytes,
+                regression_tmp_dir,
+            )
+            model_buffers.append(buf)
+            regression_buffers.append(buf)
+            regression_buffer_info.append(
+                {
+                    "label": label,
+                    "role": "model",
+                    "gigabytes": round(buf.bytes_allocated / (1024 ** 3), 3),
+                    "storage": "disk" if buf.path else "ram",
+                    "path": str(buf.path) if buf.path else None,
+                }
+            )
+        regression_r2 = np.zeros(
+            (len(neural_signal_sets), len(model_arrays), subsample_tps, subsample_tps),
+            dtype=np.float32,
+        )
+    else:
+        rsa_accumulators = np.zeros(
+            (len(neural_signal_sets), len(model_arrays), subsample_tps, subsample_tps),
+            dtype=np.float32,
+        )
+        lag_curves_samples = [[[] for _ in model_arrays] for _ in neural_signal_sets]
+
+    store_log_interval = max(1, args.progress_log_every)
+    iterations_completed = 0
+
+    border_plot_summary = None
+    try:
+        log(f"... processing subsamples and computing dRSA (run: {run_suffix_clean})")
+        for iteration_idx, window_indices in enumerate(subsample_indices):
+            iterations_completed = iteration_idx + 1
+
+            neural_rdm_series_per_signal = []
+            for (_, neural_data_array), neural_metric in zip(neural_signal_sets, neural_metrics):
+                neural_rdm = compute_rdm_series_from_indices(
+                    neural_data_array, window_indices, neural_metric
+                )
+                if not double_precision:
+                    neural_rdm = neural_rdm.astype(np.float32, copy=False)
+                neural_rdm_series_per_signal.append(neural_rdm)
+
+            model_rdm_series = []
+            for model_idx, model in enumerate(model_arrays):
+                model_rdm = compute_rdm_series_from_indices(
+                    model, window_indices, model_metrics[model_idx]
+                )
+                if not double_precision:
+                    model_rdm = model_rdm.astype(np.float32, copy=False)
+                model_rdm_series.append(model_rdm)
+
+            if use_regression:
+                for neural_idx, neural_rdm in enumerate(neural_rdm_series_per_signal):
+                    neural_buffers[neural_idx].array[iteration_idx] = neural_rdm.astype(
+                        target_dtype, copy=False
+                    )
+                for model_idx, model_rdm in enumerate(model_rdm_series):
+                    model_buffers[model_idx].array[iteration_idx] = model_rdm.astype(
+                        target_dtype, copy=False
+                    )
+                if iteration_idx == 0 or iterations_completed % store_log_interval == 0:
+                    log(
+                        f"[{rsa_computation_method}] buffered {iterations_completed}/{subsampling_iterations} "
+                        f"iterations (run: {run_suffix_clean})"
+                    )
+            else:
+                for neural_idx, neural_rdm in enumerate(neural_rdm_series_per_signal):
+                    for model_idx, model_rdm in enumerate(model_rdm_series):
+                        rsa_matrix_it, lag_curve_it = compute_rsa_matrix_corr(
+                            neural_rdm,
+                            model_rdm,
+                            return_lag_curves=True,
+                            lag_window=adtw_in_tps,
+                        )
+                        rsa_accumulators[neural_idx, model_idx] += rsa_matrix_it
+                        lag_curves_samples[neural_idx][model_idx].append(
+                            lag_curve_it.astype(np.float32, copy=False)
+                        )
+
+        if iterations_completed != subsampling_iterations:
+            raise RuntimeError(
+                f"Expected {subsampling_iterations} iterations, but processed {iterations_completed}."
+            )
+
+        if use_regression:
+            regression_config = RegressionConfig(
+                method=rsa_computation_method,
+                alpha=args.regression_alpha,
+                l1_ratio=args.regression_l1_ratio,
+                variance_threshold=args.pcr_variance_threshold,
+                border_threshold=args.regression_border_threshold,
+                border_thresholds=model_border_thresholds,
+                plot_borders=args.plot_regression_borders,
+                border_plot_dir=(
+                    regression_border_dir if args.plot_regression_borders else None
+                ),
+                progress_iterations=args.progress_log_every,
+                neural_progress_step=args.progress_neural_step,
+            )
+            if args.plot_regression_borders:
+                regression_border_dir.mkdir(parents=True, exist_ok=True)
+            for buf in neural_buffers + model_buffers:
+                buf.flush()
+
+            rsa_matrices = np.zeros(
+                (len(neural_signal_sets), len(model_arrays), subsample_tps, subsample_tps),
+                dtype=np.float32,
+            )
+            for neural_idx, (neural_label, _) in enumerate(neural_signal_sets):
+                prefix = f"[{rsa_computation_method}][{run_suffix_clean}:{slugify_label(neural_label)}]"
+                logger_fn = lambda message, prefix=prefix: log(f"{prefix} {message}")
+                result = compute_dRSA_regression(
+                    neural_buffers[neural_idx].array,
+                    [buf.array for buf in model_buffers],
+                    adtw_in_tps,
+                    regression_config,
+                    logger=logger_fn,
+                    model_labels=model_labels,
+                )
+                rsa_matrices[neural_idx] = result.betas
+                regression_r2[neural_idx] = result.r2
+                if border_plot_summary is None and result.stats.get("border_plots"):
+                    border_plot_summary = result.stats["border_plots"]
+                stats_entry = {
+                    "neural_label": neural_label,
+                    **result.stats,
+                    "r2_mean": float(np.mean(result.r2)),
+                    "r2_max": float(np.max(result.r2)),
+                }
+                regression_stats_summary.append(stats_entry)
+                log(
+                    f"[{rsa_computation_method}] neural '{neural_label}' R² mean "
+                    f"{stats_entry['r2_mean']:.3f} (max {stats_entry['r2_max']:.3f})"
+                )
+                if "pca_components" in result.stats:
+                    pcs = result.stats["pca_components"]
+                    log(
+                        f"[{rsa_computation_method}] PCA components retained for '{neural_label}': "
+                        f"min={pcs['min']} median={pcs['median']:.1f} max={pcs['max']}"
+                    )
+
+            lag_len = 2 * adtw_in_tps + 1
+            lag_curves_array = np.zeros(
+                (len(neural_signal_sets), len(model_arrays), lag_len), dtype=np.float32
+            )
+            for neural_idx in range(len(neural_signal_sets)):
+                for model_idx in range(len(model_arrays)):
+                    _, lag_curve_vals = compute_lag_correlation(
+                        rsa_matrices[neural_idx, model_idx], adtw_in_tps
+                    )
+                    lag_curves_array[neural_idx, model_idx] = lag_curve_vals.astype(
+                        np.float32, copy=False
+                    )
+            if save_lag_curves:
+                np.save(lag_curves_path, lag_curves_array)
+        else:
+            rsa_matrices = rsa_accumulators / iterations_completed
+            lag_curves_per_signal_model = [
+                [np.stack(curves, axis=0) if curves else None for curves in lag_curve_list]
+                for lag_curve_list in lag_curves_samples
+            ]
+            lag_curves_complete = all(
+                all(curves is not None for curves in model_list)
+                for model_list in lag_curves_per_signal_model
+            )
+            if lag_curves_complete:
+                lag_curves_array = np.stack(
+                    [np.stack(model_list, axis=0) for model_list in lag_curves_per_signal_model],
+                    axis=0,
+                ).astype(np.float32, copy=False)
+                if save_lag_curves:
+                    np.save(lag_curves_path, lag_curves_array)
+    finally:
+        for buf in regression_buffers:
+            buf.cleanup()
 
     log("✓ compute dRSA matrices")
 
     if save_rsa_matrices:
-        target_dtype = np.float64 if double_precision else np.float32
         rsa_matrices_arr = np.asarray(rsa_matrices, dtype=target_dtype)
         np.save(rsa_matrices_path, rsa_matrices_arr)
 
     plot_exists = plot_path.exists()
+    subsample_plot_exists = subsample_plot_path.exists()
+
+    regression_metadata = {
+        "method": rsa_computation_method,
+        "use_regression": use_regression,
+        "alpha": args.regression_alpha if use_regression else None,
+        "l1_ratio": args.regression_l1_ratio if use_regression else None,
+        "variance_threshold": args.pcr_variance_threshold if use_regression else None,
+        "border_threshold": args.regression_border_threshold if use_regression else None,
+        "border_thresholds": model_border_thresholds if use_regression else None,
+        "plot_regression_borders": args.plot_regression_borders if use_regression else None,
+        "mem_threshold_gb": args.regression_mem_threshold_gb if use_regression else None,
+        "buffer_info": regression_buffer_info,
+        "stats_per_neural": regression_stats_summary if regression_stats_summary else None,
+        "tmp_dir": str(regression_tmp_dir) if use_regression else None,
+        "border_plots": border_plot_summary if use_regression else None,
+        "r2_global_mean": float(np.mean(regression_r2)) if regression_r2 is not None else None,
+        "r2_global_max": float(np.max(regression_r2)) if regression_r2 is not None else None,
+    }
 
     analysis_metadata = {
         "subject": subject,
@@ -809,6 +1145,7 @@ def execute_drsa_run(
         "analysis_name": analysis_name,
         "analysis_run_id": analysis_run_id,
         "simulation": simulation_info,
+        "regression": regression_metadata,
         "word_onsets": {
             "expected_path": str(word_onsets_expected_path),
             "resolved_path": str(word_onsets_path) if word_onsets_path else None,
@@ -898,7 +1235,6 @@ def execute_drsa_run(
         ),
         "plot_path": plot_path,
     }
-
 
 if args.simulation:
     neural_reference_label = f"{subject_label} Neural"
