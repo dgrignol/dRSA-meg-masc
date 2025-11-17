@@ -49,6 +49,7 @@ def generate_plots(
     analysis_parameters,
     lag_bootstrap_settings,
     plot_path,
+    fixed_ylim: tuple[float, float] | None = None,
 ):
     """Render per-neural dRSA figures combining RSA matrices and lag curves.
 
@@ -73,6 +74,8 @@ def generate_plots(
     plot_path : str or Path
         Base output path. When multiple neural signals are present, the label is
         appended to the filename before saving.
+    fixed_ylim : tuple[float, float], optional
+        If provided, force the lag-correlation axes to use this y-range.
 
     Returns
     -------
@@ -181,6 +184,8 @@ def generate_plots(
                 fontsize=10,
                 fontweight="bold",
             )
+            if fixed_ylim is not None:
+                ax_lag.set_ylim(fixed_ylim)
 
             peak_idx = np.argmax(lag_corr)
             peak_lag = lags_sec[peak_idx]
@@ -381,9 +386,15 @@ def generate_autocorr_summary_plot(
 
 
 def plot_run_from_metadata(
-    metadata_path: Path, results_dir: Path
+    metadata_path: Path,
+    results_dir: Path,
+    custom_ylim: tuple[float, float] | None = None,
 ) -> tuple[str, list[str], dict | None]:
-    """Load metadata for a single run and generate the corresponding plots."""
+    """Load metadata for a single run and generate the corresponding plots.
+
+    When ``custom_ylim`` is provided, a second copy of each plot is created with
+    the lag-correlation axis constrained to that range and a descriptive suffix.
+    """
     with metadata_path.open("r") as f:
         metadata = json.load(f)
 
@@ -442,6 +453,12 @@ def plot_run_from_metadata(
     analysis_parameters = metadata["analysis_parameters"]
     lag_bootstrap_settings = metadata.get("lag_bootstrap_settings", {})
 
+    plot_path_str = str(plot_path)
+
+    def add_suffix(path_str: str, suffix: str) -> str:
+        base, ext = os.path.splitext(path_str)
+        return f"{base}{suffix}{ext}"
+
     saved_paths = generate_plots(
         rsa_matrices,
         lag_curves_array,
@@ -449,8 +466,23 @@ def plot_run_from_metadata(
         neural_labels,
         analysis_parameters,
         lag_bootstrap_settings,
-        str(plot_path),
+        plot_path_str,
     )
+    if custom_ylim is not None:
+        ymin, ymax = custom_ylim
+        suffix = f"_ylim_{ymin:g}_{ymax:g}"
+        custom_plot_path = add_suffix(plot_path_str, suffix)
+        custom_paths = generate_plots(
+            rsa_matrices,
+            lag_curves_array,
+            model_labels,
+            neural_labels,
+            analysis_parameters,
+            lag_bootstrap_settings,
+            custom_plot_path,
+            fixed_ylim=custom_ylim,
+        )
+        saved_paths.extend(custom_paths)
     autocorr_entry = None
     simulation_info = metadata.get("simulation") or {}
     if simulation_info.get("enabled"):
@@ -523,7 +555,24 @@ def main():
         default=None,
         help="Legacy override pointing directly to cached dRSA outputs.",
     )
+    parser.add_argument(
+        "--custom-ylim",
+        nargs=2,
+        type=float,
+        metavar=("YMIN", "YMAX"),
+        help=(
+            "When provided, also save a copy of each plot with the lag y-axis fixed "
+            "to the supplied range (min max)."
+        ),
+    )
     args = parser.parse_args()
+
+    custom_ylim: tuple[float, float] | None = None
+    if args.custom_ylim is not None:
+        ymin, ymax = args.custom_ylim
+        if ymin >= ymax:
+            parser.error("--custom-ylim requires YMIN to be smaller than YMAX.")
+        custom_ylim = (ymin, ymax)
 
     if args.subject.startswith("sub-"):
         subject_label = args.subject
@@ -620,7 +669,11 @@ def main():
     for metadata_path, base_dir in metadata_jobs:
         if not metadata_path.exists():
             raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
-        run_id, saved_paths, autocorr_entry = plot_run_from_metadata(metadata_path, base_dir)
+        run_id, saved_paths, autocorr_entry = plot_run_from_metadata(
+            metadata_path,
+            base_dir,
+            custom_ylim=custom_ylim,
+        )
         if len(saved_paths) == 1:
             print(f"✓ {run_id}: saved dRSA plot to {saved_paths[0]}")
         else:
