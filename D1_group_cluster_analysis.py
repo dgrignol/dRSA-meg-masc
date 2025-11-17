@@ -173,6 +173,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--show-single-subject-curves",
+        action="store_true",
+        help=(
+            "Overlay individual subject lag curves in the summary plots (rendered as faint grey "
+            "lines behind the group average)."
+        ),
+    )
+    parser.add_argument(
         "--simulation-noise",
         action="store_true",
         help=(
@@ -679,12 +687,14 @@ def create_summary_plot(
     lag_significance_masks: np.ndarray,
     model_labels: Sequence[str],
     output_path: Path,
+    subject_lag_curves: Optional[np.ndarray] = None,
     vector_output_path: Optional[Path] = None,
     neural_label: Optional[str] = None,
     analysis_caption: Optional[str] = None,
     matrix_significance_masks: Optional[np.ndarray] = None,
     locked_to_word_onset: bool = False,
     matrix_extent_sec: Optional[Tuple[float, float, float, float]] = None,
+    show_single_subject_curves: bool = False,
 ) -> None:
     """
     Build a figure summarising average dRSA matrices, lag curves, and significant clusters.
@@ -697,6 +707,8 @@ def create_summary_plot(
         Group-average lag curves with shape (n_models, n_times).
     sem_lag_curves:
         Standard error of the mean for each lag curve with the same shape as ``avg_lag_curves``.
+    subject_lag_curves:
+        Optional array of per-subject lag curves with shape (n_subjects, n_models, n_times).
     lags_sec:
         Array of lag positions in seconds aligned with the lag curves.
     lag_significance_masks:
@@ -713,8 +725,19 @@ def create_summary_plot(
         Optional boolean arrays highlighting significant samples within the dRSA matrices.
     locked_to_word_onset:
         Flag indicating whether subsamples were locked to word onset (annotated in the title).
+    show_single_subject_curves:
+        When True, plot the provided individual curves behind the group average.
     """
     n_models = len(model_labels)
+    overlay_curves: Optional[np.ndarray] = None
+    if show_single_subject_curves and subject_lag_curves is not None:
+        overlay_curves = np.asarray(subject_lag_curves)
+        if overlay_curves.ndim != 3:
+            LOGGER.warning(
+                "Expected subject lag curves with shape (n_subjects, n_models, n_times); received %s. Skipping overlay.",
+                overlay_curves.shape,
+            )
+            overlay_curves = None
     fig = plt.figure(figsize=(12, 3 * n_models + 0.75), constrained_layout=True)
     height_ratios = [1.0] * n_models + [0.25]
     grid = fig.add_gridspec(n_models + 1, 2, height_ratios=height_ratios)
@@ -770,9 +793,21 @@ def create_summary_plot(
         sem = sem_lag_curves[idx]
         significant = lag_significance_masks[idx]
 
+        if overlay_curves is not None and idx < overlay_curves.shape[1]:
+            single_subject_traces = overlay_curves[:, idx, :]
+            for trace in single_subject_traces:
+                ax_lag.plot(
+                    lags_sec,
+                    trace,
+                    color="#7f7f7f",
+                    alpha=0.35,
+                    linewidth=0.8,
+                    zorder=1,
+                )
+
         line_color = "#1f77b4"
         fill_color = "#9ecae1"
-        ax_lag.plot(lags_sec, curve, color=line_color, label="Mean lag corr")
+        ax_lag.plot(lags_sec, curve, color=line_color, label="Mean lag corr", zorder=3)
         ax_lag.fill_between(
             lags_sec,
             curve - sem,
@@ -780,6 +815,7 @@ def create_summary_plot(
             color=fill_color,
             alpha=0.4,
             label="SEM",
+            zorder=2,
         )
 
         if np.any(significant):
@@ -966,6 +1002,7 @@ def main() -> int:
         raise FileNotFoundError(f"Results directory {results_dir} does not exist.")
 
     output_path = args.output
+    auto_named_output = output_path is None
     if output_path is None:
         if results_dir_mode == "analysis" and group_level_dir is not None:
             output_path = group_level_dir / "group_dRSA_summary.png"
@@ -973,6 +1010,10 @@ def main() -> int:
             output_path = Path("results") / "group_level" / "group_dRSA_summary.png"
     if not output_path.is_absolute():
         output_path = (repo_root / output_path).resolve()
+    overlay_suffix = ""
+    if args.show_single_subject_curves and auto_named_output:
+        overlay_suffix = "_with_subject_curves"
+        output_path = output_path.with_name(f"{output_path.stem}{overlay_suffix}{output_path.suffix}")
     # Always emit a vector copy alongside the raster PNG for downstream figure editing.
     vector_output_path = output_path.with_suffix(".pdf")
     summary_cache = args.summary_cache
@@ -1025,6 +1066,7 @@ def main() -> int:
             return candidate
 
         for cache_path in cache_candidates:
+            subject_lag_curves = None
             with np.load(cache_path, allow_pickle=True) as cache_payload:
                 avg_matrices = cache_payload["avg_matrices"]
                 avg_lag_curves = cache_payload["avg_lag_curves"]
@@ -1050,6 +1092,8 @@ def main() -> int:
                     matrix_significance_masks = matrix_significance_masks.astype(bool)
                 else:
                     matrix_significance_masks = np.zeros_like(avg_matrices, dtype=bool)
+                if "subject_lag_curves" in getattr(cache_payload, "files", []):
+                    subject_lag_curves = cache_payload["subject_lag_curves"]
             output_path_local = output_path
             vector_output_local = vector_output_path
             locked_to_word_onset_cached = False
@@ -1088,11 +1132,17 @@ def main() -> int:
                             matrix_extent_sec = (0.0, float(dur_sec), 0.0, float(dur_sec))
                     except Exception:
                         matrix_extent_sec = None
+            if args.show_single_subject_curves and subject_lag_curves is None:
+                LOGGER.warning(
+                    "Single-subject lag curves were not stored in cache %s; overlay cannot be generated.",
+                    cache_path,
+                )
 
             create_summary_plot(
                 avg_matrices=avg_matrices,
                 avg_lag_curves=avg_lag_curves,
                 sem_lag_curves=sem_lag_curves,
+                subject_lag_curves=subject_lag_curves,
                 lags_sec=lags_sec,
                 lag_significance_masks=lag_significance_masks,
                 model_labels=model_labels,
@@ -1103,6 +1153,7 @@ def main() -> int:
                 matrix_significance_masks=matrix_significance_masks,
                 locked_to_word_onset=locked_to_word_onset_cached,
                 matrix_extent_sec=matrix_extent_sec,
+                show_single_subject_curves=args.show_single_subject_curves,
             )
             LOGGER.info(
                 "Regenerated group summary figure (PNG: %s, PDF: %s) using cached results (%s).",
@@ -1283,6 +1334,7 @@ def main() -> int:
             avg_matrices=avg_matrices,
             avg_lag_curves=avg_lag_curves,
             sem_lag_curves=sem_lag_curves,
+            subject_lag_curves=lag_curves_neural,
             lags_sec=lags_sec,
             lag_significance_masks=lag_significance_masks,
             model_labels=args.models,
@@ -1294,6 +1346,7 @@ def main() -> int:
             locked_to_word_onset=locked_to_word_onset,
             matrix_extent_sec=(0.0, float(analysis_parameters_template.get("subsample_tps", matrices_neural.shape[-1]) / resolution),
                                0.0, float(analysis_parameters_template.get("subsample_tps", matrices_neural.shape[-1]) / resolution)),
+            show_single_subject_curves=args.show_single_subject_curves,
         )
 
         analysis_settings: Dict[str, Any] = {
@@ -1312,6 +1365,7 @@ def main() -> int:
             "matrix_cluster_analysis": run_matrix_clusters,
             "matrix_downsample_factor": matrix_downsample_factor,
         }
+        analysis_settings["single_subject_overlay"] = args.show_single_subject_curves
         analysis_settings["input_dir"] = str(results_dir)
         analysis_settings["simulation_mode"] = args.simulation_noise
         if args.simulation_noise:
@@ -1332,6 +1386,7 @@ def main() -> int:
             avg_matrices=avg_matrices,
             avg_lag_curves=avg_lag_curves,
             sem_lag_curves=sem_lag_curves,
+            subject_lag_curves=lag_curves_neural,
             lags_sec=lags_sec,
             significance_masks=lag_significance_masks,
             model_labels=np.array(args.models, dtype=object),

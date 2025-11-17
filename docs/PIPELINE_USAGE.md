@@ -46,23 +46,6 @@ Concatenates per-run derivatives into subject-level arrays and audio files.
 
 > **Note**: A3 (`A3_resample_concatenated_data.py`) is automatically invoked by both pipeline wrappers to downsample the concatenated files. Run it manually if you skip the wrappers.
 
-### check_word_onset_extraction.py
-Quick visual check that the concatenated word onsets exported by A2 align with the audio envelope and sentence mask. 
-
-- **Input**:
-`derivatives/preprocessed/<subject>/concatenated/<subject>_concatenated_word_onsets_sec.npy` (from A2_concatenate_subject_data.py), `*_concatenated_sentence_mask_100Hz.npy` (from A2_concatenate_subject_data.py), and the 100 Hz speech envelope at `derivatives/Models/envelope/<subject>/concatenated/<subject>_concatenated_envelope_100Hz.npy` (from B1_model_envelope.py).
-- **Output**: `word_onsets.png` in the current directory showing:
-  - mean envelope (blue),
-  - shaded regions where the sentence mask is active,
-  - vertical markers at every extracted word onset.
-- **Usage**
-  ```bash
-  python check_word_onset_extraction.py          # defaults to sub-01 and saves word_onsets.png
-  python check_word_onset_extraction.py --help   # edit the script to point at other subjects
-  ```
-- Adjust `subject` and `time_window` at the top of the script to explore different participants or time spans.
-
-
 ### B1_model_envelope.py
 Builds broadband gammatone speech envelopes for every run and subject.
 
@@ -263,6 +246,95 @@ Aggregates subject dRSA results, performs a cluster-based permutation test, and 
   - Matrix permutation results are cached alongside the usual averages so replotting with `--plot-only` reproduces the overlays without recomputation.
 - **Logging**
   - Default verbosity is now `DEBUG`, which prints progress messages at the 10th permutation and every subsequent 100 iterations for both lag and matrix cluster loops. Switch to `--log-level INFO` (or higher) to suppress detailed progress reporting.
+
+### Diagnostic helpers (`check_*` scripts)
+The repository ships several lightweight `check_*.py` utilities that visualise intermediate artefacts or regenerate cached figures without rerunning expensive stages. Use them as spot-checks while iterating on the pipeline.
+
+#### check_word_onset_extraction.py
+Validate that concatenated word onsets align with the audio envelope and sentence mask produced in stages A2/B1.
+
+- **Inputs** – `derivatives/preprocessed/<subject>/concatenated/*_word_onsets_sec.npy`, `*_sentence_mask_100Hz.npy`, and the 100 Hz speech envelope from `derivatives/Models/envelope/<subject>/concatenated/`.
+- **Output** – `word_onsets.png` (current working directory) showing the mean envelope, shaded sentence mask, and vertical onset markers. Adjust the axes by editing `time_window`.
+- **Usage**
+  ```bash
+  python check_word_onset_extraction.py          # defaults to sub-01 and a 30 s window
+  ```
+- **Notes** – set `subject` (e.g., `"sub-12"`) and `time_window` near the top of the script to inspect different participants or segments.
+
+#### check_mask_resampling.py
+Zoom into any part of the resampled sentence/concatenation masks without re-running `A3_resample_concatenated_data.py`.
+
+- **Inputs** – 1 kHz and 100 Hz mask arrays stored under `derivatives/preprocessed/<subject>/concatenated/` (produced by A2/A3).
+- **Output** – `results/<subject>_mask_resampling_<start>-<end>s.png` with the before/after comparison over the requested time window.
+- **Usage**
+  ```bash
+  python check_mask_resampling.py  # edit the subject/start_sec/end_sec constants in the file
+  ```
+- **Notes** – tweak the `subject`, `start_sec`, and `end_sec` variables near the top; the helper delegates plotting to `plot_masks_comparison` so its layout matches the A3 diagnostics.
+
+#### check_regr_boarder.py
+Replot the dRSA regression border diagnostics saved by `C1_dRSA_run.py` with custom thresholds (per model label) before locking them into publications.
+
+- **Inputs** – metadata JSON produced by C1 (`results/<analysis_name>/single_subjects/*_metadata.json`) that contains the cached border plot entries (`--plot-regression-borders` must have been enabled).
+- **Output** – PNGs written next to the original border plots inside `inspect_borders_<thresholds>/`, each comparing the original threshold/border and the proposed replacement.
+- **Key options**
+  - positional `analysis_name` – name of the analysis under `results/`.
+  - `--results-root PATH` – change the root directory (default `results`).
+  - `--metadata FILE` – directly pass a specific `*_metadata.json` instead of auto-discovering it.
+  - `--default-threshold FLOAT` – override `DEFAULT_NEW_BORDER` from the CLI; individual labels can still be hard-coded in `MODEL_THRESHOLD_OVERRIDES`.
+- **Usage**
+  ```bash
+  python check_regr_boarder.py lexical_mem_2024 --default-threshold 0.08
+  python check_regr_boarder.py lexical_mem_2024 --metadata results/.../sub-01_metadata.json
+  ```
+- **Notes** – edit the `MODEL_THRESHOLD_OVERRIDES` dictionary within the script to experiment with per-model thresholds, then rerun the command to regenerate the comparison figures.
+
+#### check_decoding.py
+Implements a quick-and-dirty LDA decoding benchmark (word frequency vs. phoneme voicing) to spot regressions in preprocessing.
+
+- **Inputs** – the anonymised BIDS dataset (`bids_anonym/`) plus `phoneme_info.csv` in the repo root. Store the data root in `data_path.txt` (one path per line) so the script finds it automatically; otherwise it prompts for the path interactively.
+- **Outputs** – `decoding.html` (an MNE report with evoked/decoding plots) and `decoding_results.csv` summarising the per-time decoding scores for each subject/contrast.
+- **Usage**
+  ```bash
+  # Populate data_path.txt once, then rerun freely
+  echo "/path/to/project_root" > data_path.txt
+  python check_decoding.py
+  ```
+- **Notes** – the helper iterates over every subject listed in `participants.tsv`; skip unavailable IDs by editing that TSV or temporarily commenting them out in the script.
+
+#### check_ERF.py
+Builds on `check_decoding.py` to compute and plot the median magnetometer evoked response (word epochs only) over any subject subset.
+
+- **Inputs** – same BIDS derivatives required by `check_decoding.py`; the script reuses `check_decoding._get_epochs` under the hood.
+- **Outputs** – a multi-panel figure (default `results/investigate_envelope/median_ERF.png`) and, optionally, a saved `*.fif` with the median evoked when `--evoked-out` is provided.
+- **Key options**
+  - `--subjects 0001 0002` – restrict to specific participants (default: everyone in `participants.tsv`).
+  - `--topomap-times -0.1 0.0 0.1 ...` – customise the snapshot times.
+  - `--output PATH`, `--dpi INT`, `--evoked-out PATH`, `--overwrite`.
+- **Usage**
+  ```bash
+  python check_ERF.py --subjects 0001 0002 --output results/qa/median_erf.png --overwrite
+  python check_ERF.py --evoked-out results/qa/median_erf.fif --topomap-times -0.1 0.2 0.4
+  ```
+
+#### check_plots_by_subject.py
+Regenerates group-level dRSA plots from cached `.npz` bundles so you can tweak plot destinations or overlay single-subject lag curves without rerunning D1.
+
+- **Inputs** – cached `group_dRSA_summary*.npz` files stored under `results/<analysis_name>/group_level/`.
+- **Outputs** – PNG/PDF copies written to a user-defined folder (inside `results/` by default) that mirror the formatting of `D1_group_cluster_analysis.py --plot-only --show-single-subject-curves`.
+- **Key options**
+  - `--analysis-name NAME` (required) – choose which analysis to load.
+  - `--plot-location SUBDIR` (required) – subfolder under `results/` where the regenerated plots are written; pass an absolute path to place them elsewhere.
+  - `--results-root PATH` – change the base directory (default `results` relative to the repo).
+  - `--log-level {DEBUG,INFO,...}` – control console verbosity.
+- **Usage**
+  ```bash
+  python check_plots_by_subject.py \
+    --analysis-name lexical_mem_2024 \
+    --plot-location inspect_single_subject_curves \
+    --log-level DEBUG
+  ```
+- **Notes** – the helper respects cached single-subject lag curves; if they are missing it still produces group averages but emits a warning that the overlay will be skipped.
 
 ---
 

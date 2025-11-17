@@ -22,14 +22,27 @@ mne.set_log_level(False)
 class PATHS:
     path_file = Path("./data_path.txt")
     if not path_file.exists():
-        data = Path(input("data_path?"))
+        data = Path(input("data_path?")).expanduser()
         assert data.exists()
         with open(path_file, "w") as f:
             f.write(str(data) + "\n")
     with open(path_file, "r") as f:
-        data = Path(f.readlines()[0].strip("\n"))
+        candidates = [
+            Path(line.strip()).expanduser() for line in f.readlines() if line.strip()
+        ]
+    assert len(candidates), "data_path.txt is empty. Please add a valid path."
 
-    assert data.exists()
+    data = None
+    for candidate in candidates:
+        if candidate.exists():
+            data = candidate
+            break
+
+    if data is None:
+        raise FileNotFoundError(
+            "None of the paths listed in data_path.txt exist. "
+            "Update the file with a valid project root."
+        )
 
     bids = data / "bids_anonym"
 
