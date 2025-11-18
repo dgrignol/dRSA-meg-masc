@@ -36,7 +36,21 @@ from meeting
 
 
 RUN NEXT:
-- [ ] same as before (only participant 1 but tuning parameters of elastic net)
+
+TUNING ELASTICNET PARAMETERS:
+- [ ] alpha 0.05; l1-ratio 0.7 
+qsub -v ANALYSIS_NAME=elasticnet_alpha0p05_l1ratio0p7,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal" \
+     -t 1 \
+     s2_submit_C1_subject.sh -- --regression-method elasticnet --regression-alpha 0.05 --regression-l1-ratio 0.7 --progress-log-every 1 --progress-neural-step 1
+- > logs/C1_dRSA.87551.1.out
+
+- [ ] alpha 0.01; l1-ratio 0.7 
+qsub -v ANALYSIS_NAME=elasticnet_alpha0p01_l1ratio0p7,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal" \
+     -t 1 \
+     s2_submit_C1_subject.sh -- --regression-method elasticnet --regression-alpha 0.01 --regression-l1-ratio 0.7 --progress-log-every 1 --progress-neural-step 1
+- > logs/C1_dRSA.87552.1.out
+
+
 
  - [ ] qsub -v ANALYSIS_NAME=elasticnet_nolock_nooverlap,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal"      -t 2-27      s2_submit_C1_subject.sh      -- --regression-method elasticnet --progress-log-every 1 --progress-neural-step 1
 

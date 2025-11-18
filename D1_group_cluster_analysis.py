@@ -761,18 +761,6 @@ def _resolve_custom_matrix_cut_config(
     _validate_bounds("neural", min_neural, max_neural)
     _validate_bounds("model", min_model, max_model)
 
-    if not (
-        np.isclose(min_neural, min_model) and np.isclose(max_neural, max_model)
-    ):
-        LOGGER.warning(
-            "--custom_matrix_cut neural/model limits differ (neural %.3f–%.3f vs model %.3f–%.3f).",
-            min_neural,
-            max_neural,
-            min_model,
-            max_model,
-        )
-        raise ValueError("behaviour for rectangular windows need implementation")
-
     def _sec_to_indices(start_sec: float, end_sec: float) -> Tuple[int, int]:
         start_idx = max(0, int(np.floor(start_sec * resolution_hz)))
         stop_idx = min(subsample_tps, int(np.ceil(end_sec * resolution_hz)))
