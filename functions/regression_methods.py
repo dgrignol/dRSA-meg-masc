@@ -241,6 +241,11 @@ def compute_dRSA_regression(
             raise ValueError(
                 f"Model index {idx} shape {model.shape} does not match neural shape {neural.shape}."
             )
+    model_labels_safe = (
+        list(model_labels)
+        if model_labels and len(model_labels) == len(models)
+        else [f"Model {idx}" for idx in range(len(models))]
+    )
 
     n_models = len(models)
     window_radius = averaging_diagonal_time_tps
@@ -279,6 +284,15 @@ def compute_dRSA_regression(
         neural_iter = neural[iteration]
         iter_start = time.perf_counter()
         neural_step = max(1, config.neural_progress_step)
+        r2_running_sum = 0.0
+        r2_running_max = float("-inf")
+        r2_cells_processed = 0
+        total_cells = subsample_tps * subsample_tps
+        model_r2_stats = [
+            {"sum": 0.0, "max": float("-inf"), "count": 0} for _ in range(n_models)
+        ]
+        midpoint_logged = False
+        midpoint = max(1, subsample_tps // 2)
         for t_neural in range(subsample_tps):
             if logger and t_neural % neural_step == 0:
                 logger(
@@ -315,6 +329,15 @@ def compute_dRSA_regression(
                     )
                     betas_sum[model_idx, t_neural, t_model] += coef[0]
                     r2_sum[model_idx, t_neural, t_model] += stats["r2"]
+                    r2_running_sum += stats["r2"]
+                    r2_cells_processed += 1
+                    if stats["r2"] > r2_running_max:
+                        r2_running_max = stats["r2"]
+                    per_model = model_r2_stats[model_idx]
+                    per_model["sum"] += stats["r2"]
+                    per_model["count"] += 1
+                    if stats["r2"] > per_model["max"]:
+                        per_model["max"] = stats["r2"]
                     if method_lc == "pcr":
                         pc_counts.append(int(stats["n_components"]))
 
@@ -329,10 +352,32 @@ def compute_dRSA_regression(
                     remaining = total_steps - processed_steps
                     eta_seconds = elapsed_total / processed_steps * remaining
                     eta_str = f" | ETA {format_duration(eta_seconds)}"
+                r2_mean = (
+                    r2_running_sum / r2_cells_processed if r2_cells_processed else 0.0
+                )
+                r2_max = r2_running_max if r2_running_max != float("-inf") else 0.0
                 logger(
                     f"[{config.method}] iteration {iteration + 1}/{iterations} "
                     f"neural {t_neural + 1}/{subsample_tps} "
-                    f"({neural_elapsed:.1f}s elapsed in iteration){eta_str}"
+                    f"({neural_elapsed:.1f}s elapsed in iteration) "
+                    f"R² mean {r2_mean:.3f} max {r2_max:.3f}{eta_str}"
+                )
+            if (
+                logger
+                and not midpoint_logged
+                and t_neural + 1 >= midpoint
+            ):
+                midpoint_logged = True
+                summary_parts = []
+                for stats_pm, label in zip(model_r2_stats, model_labels_safe, strict=False):
+                    mean_pm = (
+                        stats_pm["sum"] / stats_pm["count"] if stats_pm["count"] else 0.0
+                    )
+                    max_pm = stats_pm["max"] if stats_pm["max"] != float("-inf") else 0.0
+                    summary_parts.append(f"{label}:{mean_pm:.3f}/{max_pm:.3f}")
+                logger(
+                    f"[{config.method}] iteration {iteration + 1}/{iterations} midpoint R² "
+                    + ", ".join(summary_parts)
                 )
 
         if logger and ((iteration + 1) % iteration_log_interval == 0 or iteration == iterations - 1):
