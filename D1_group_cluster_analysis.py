@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from matplotlib import pyplot as plt
+from matplotlib.patches import Rectangle
 from scipy import ndimage
 from scipy.stats import ttest_rel, t
 
@@ -202,6 +203,21 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Override the required simulation origin recorded in metadata "
             "(default: 'synthetic' when --simulation-noise is provided)."
+        ),
+    )
+    parser.add_argument(
+        "--custom_matrix_cut",
+        nargs=4,
+        type=float,
+        metavar=(
+            "MIN_NEURAL_TIME",
+            "MAX_NEURAL_TIME",
+            "MIN_MODEL_TIME",
+            "MAX_MODEL_TIME",
+        ),
+        help=(
+            "Restrict lag-curve/matrix statistics to a sub-section of the dRSA matrix. "
+            "Provide times in seconds relative to the subsample window (e.g., 0 5 2.45 3.5)."
         ),
     )
     parser.add_argument(
@@ -419,7 +435,21 @@ def compute_lag_curve_from_matrix(matrix: np.ndarray, adtw_in_tps: int) -> Tuple
     """Collapse a dRSA matrix into a lag curve by averaging diagonals across a centred window."""
     from functions.core_functions import compute_lag_correlation
 
-    lags_tp, lag_corr = compute_lag_correlation(matrix, adtw_in_tps)
+    matrix = np.asarray(matrix)
+    if matrix.ndim != 2:
+        raise ValueError(
+            f"Expected a 2D dRSA matrix to derive lag curves; received array with shape {matrix.shape}."
+        )
+    max_offset = min(
+        adtw_in_tps,
+        matrix.shape[-2] - 1,
+        matrix.shape[-1] - 1,
+    )
+    if max_offset < 1:
+        raise ValueError(
+            "Cannot compute lag correlations — the available matrix window is too small after applying the custom cut."
+        )
+    lags_tp, lag_corr = compute_lag_correlation(matrix, max_offset)
     return lag_corr, lags_tp
 
 
@@ -679,6 +709,149 @@ def _format_analysis_caption(
     return textwrap.fill(caption, width=110)
 
 
+def _format_custom_cut_suffix(
+    neural_bounds_sec: Tuple[float, float], model_bounds_sec: Tuple[float, float]
+) -> str:
+    """Create a short, filesystem-friendly suffix describing the custom cut bounds."""
+
+    def _fmt(value: float) -> str:
+        text = f"{value:.2f}".rstrip("0").rstrip(".")
+        if not text:
+            text = "0"
+        text = text.replace("-", "m").replace(".", "p")
+        return text
+
+    neural_fragment = f"{_fmt(neural_bounds_sec[0])}-{_fmt(neural_bounds_sec[1])}"
+    model_fragment = f"{_fmt(model_bounds_sec[0])}-{_fmt(model_bounds_sec[1])}"
+    return f"_cut_neu_{neural_fragment}_mod_{model_fragment}"
+
+
+def _resolve_custom_matrix_cut_config(
+    cut_values: Sequence[float],
+    analysis_parameters: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validate --custom_matrix_cut bounds and convert them to indices/slices."""
+
+    try:
+        resolution_hz = float(analysis_parameters["resolution_hz"])
+        subsample_tps = int(analysis_parameters["subsample_tps"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "analysis_parameters must contain resolution_hz and subsample_tps to use --custom_matrix_cut."
+        ) from exc
+
+    if resolution_hz <= 0 or subsample_tps <= 1:
+        raise ValueError(
+            f"Invalid sampling parameters (resolution_hz={resolution_hz}, subsample_tps={subsample_tps}); cannot apply custom cut."
+        )
+
+    duration_sec = subsample_tps / resolution_hz
+    min_neural, max_neural, min_model, max_model = [float(value) for value in cut_values]
+
+    def _validate_bounds(axis_name: str, minimum: float, maximum: float) -> None:
+        if maximum <= minimum:
+            raise ValueError(
+                f"--custom_matrix_cut requires {axis_name} max > min (received {minimum} and {maximum})."
+            )
+        if minimum < 0 or maximum > duration_sec:
+            raise ValueError(
+                f"--custom_matrix_cut {axis_name} bounds must lie within [0, {duration_sec:.3f}] seconds."
+            )
+
+    _validate_bounds("neural", min_neural, max_neural)
+    _validate_bounds("model", min_model, max_model)
+
+    if not (
+        np.isclose(min_neural, min_model) and np.isclose(max_neural, max_model)
+    ):
+        LOGGER.warning(
+            "--custom_matrix_cut neural/model limits differ (neural %.3f–%.3f vs model %.3f–%.3f).",
+            min_neural,
+            max_neural,
+            min_model,
+            max_model,
+        )
+        raise ValueError("behaviour for rectangular windows need implementation")
+
+    def _sec_to_indices(start_sec: float, end_sec: float) -> Tuple[int, int]:
+        start_idx = max(0, int(np.floor(start_sec * resolution_hz)))
+        stop_idx = min(subsample_tps, int(np.ceil(end_sec * resolution_hz)))
+        if stop_idx - start_idx < 2:
+            raise ValueError(
+                "--custom_matrix_cut produces fewer than two samples along an axis; widen the requested window."
+            )
+        return start_idx, stop_idx
+
+    neural_idx = _sec_to_indices(min_neural, max_neural)
+    model_idx = _sec_to_indices(min_model, max_model)
+
+    neural_bounds = (neural_idx[0] / resolution_hz, neural_idx[1] / resolution_hz)
+    model_bounds = (model_idx[0] / resolution_hz, model_idx[1] / resolution_hz)
+
+    return {
+        "neural_seconds": neural_bounds,
+        "model_seconds": model_bounds,
+        "neural_indices": neural_idx,
+        "model_indices": model_idx,
+        "neural_slice": slice(neural_idx[0], neural_idx[1]),
+        "model_slice": slice(model_idx[0], model_idx[1]),
+    }
+
+
+def _indices_to_downsample_slice(
+    start_idx: int, stop_idx: int, factor: int, max_len: int
+) -> slice:
+    """Translate sample-level indices to the coarse grid used after downsampling."""
+
+    if factor <= 1:
+        bounded_stop = min(stop_idx, max_len)
+        return slice(start_idx, bounded_stop)
+    start = start_idx // factor
+    stop = min(max_len, (stop_idx + factor - 1) // factor)
+    return slice(start, stop)
+
+
+def _recompute_lag_curves_with_custom_cut(
+    matrices_stack: np.ndarray,
+    averaging_window_tps: int,
+    neural_slice: slice,
+    model_slice: slice,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Derive lag curves from matrices restricted to the requested slices."""
+
+    n_subjects, n_neural, n_models = matrices_stack.shape[:3]
+    recomputed_curves: List[np.ndarray] = []
+    lag_axis_reference: Optional[np.ndarray] = None
+
+    for subj_idx in range(n_subjects):
+        neural_curves: List[np.ndarray] = []
+        for neural_idx in range(n_neural):
+            model_curves: List[np.ndarray] = []
+            for model_idx in range(n_models):
+                matrix = matrices_stack[subj_idx, neural_idx, model_idx]
+                matrix_cut = matrix[neural_slice, model_slice]
+                lag_curve, lags_tp = compute_lag_curve_from_matrix(
+                    matrix_cut,
+                    averaging_window_tps,
+                )
+                if lag_axis_reference is None:
+                    lag_axis_reference = lags_tp
+                elif lag_axis_reference.shape != lags_tp.shape or not np.array_equal(
+                    lag_axis_reference, lags_tp
+                ):
+                    raise ValueError(
+                        "Custom matrix cut produced inconsistent lag axes; check subject settings and window size."
+                    )
+                model_curves.append(lag_curve)
+            neural_curves.append(np.array(model_curves))
+        recomputed_curves.append(np.array(neural_curves))
+
+    if lag_axis_reference is None:
+        raise RuntimeError("Failed to compute lag axis after applying custom matrix cut.")
+
+    return np.array(recomputed_curves), lag_axis_reference
+
+
 def create_summary_plot(
     avg_matrices: np.ndarray,
     avg_lag_curves: np.ndarray,
@@ -694,6 +867,7 @@ def create_summary_plot(
     matrix_significance_masks: Optional[np.ndarray] = None,
     locked_to_word_onset: bool = False,
     matrix_extent_sec: Optional[Tuple[float, float, float, float]] = None,
+    matrix_cut_bounds_sec: Optional[Tuple[float, float, float, float]] = None,
     show_single_subject_curves: bool = False,
 ) -> None:
     """
@@ -725,6 +899,9 @@ def create_summary_plot(
         Optional boolean arrays highlighting significant samples within the dRSA matrices.
     locked_to_word_onset:
         Flag indicating whether subsamples were locked to word onset (annotated in the title).
+    matrix_cut_bounds_sec:
+        Optional tuple (neural_min, neural_max, model_min, model_max) specifying the sub-window
+        feeding the lag plots; rendered as a highlighted rectangle on the matrix panels.
     show_single_subject_curves:
         When True, plot the provided individual curves behind the group average.
     """
@@ -787,6 +964,20 @@ def create_summary_plot(
             ny, nx = avg_matrices[idx].shape
             x_coords = np.linspace(xmin, xmax, nx)
             y_coords = np.linspace(ymin, ymax, ny)
+
+        if matrix_extent_sec is not None and matrix_cut_bounds_sec is not None:
+            neural_min, neural_max, model_min, model_max = matrix_cut_bounds_sec
+            rect = Rectangle(
+                (model_min, neural_min),
+                width=max(model_max - model_min, 0),
+                height=max(neural_max - neural_min, 0),
+                linewidth=1.1,
+                edgecolor="#ff8c00",
+                linestyle=(0, (4, 3)),
+                facecolor="none",
+                zorder=6,
+            )
+            ax_matrix.add_patch(rect)
 
         ax_lag = axes[idx, 1]
         curve = avg_lag_curves[idx]
@@ -1097,6 +1288,7 @@ def main() -> int:
             output_path_local = output_path
             vector_output_local = vector_output_path
             locked_to_word_onset_cached = False
+            matrix_cut_bounds_sec = None
             if isinstance(analysis_settings, dict):
                 output_path_local = _resolve_output_path(
                     analysis_settings.get("output_path"), output_path_local
@@ -1107,6 +1299,21 @@ def main() -> int:
                 locked_to_word_onset_cached = bool(
                     analysis_settings.get("locked_to_word_onset", False)
                 )
+                cut_info = analysis_settings.get("custom_matrix_cut")
+                if isinstance(cut_info, dict):
+                    seconds_info = cut_info.get("seconds", {})
+                    neural_sec = seconds_info.get("neural")
+                    model_sec = seconds_info.get("model")
+                    try:
+                        if neural_sec and model_sec:
+                            matrix_cut_bounds_sec = (
+                                float(neural_sec[0]),
+                                float(neural_sec[1]),
+                                float(model_sec[0]),
+                                float(model_sec[1]),
+                            )
+                    except (TypeError, ValueError):
+                        matrix_cut_bounds_sec = None
             else:
                 suffix = ""
                 if cache_path.stem.startswith(summary_cache.stem):
@@ -1117,6 +1324,22 @@ def main() -> int:
                     )
                     vector_output_local = vector_output_local.with_name(
                         f"{vector_output_local.stem}{suffix}{vector_output_local.suffix}"
+                    )
+            if args.custom_matrix_cut is not None:
+                requested_bounds = tuple(float(value) for value in args.custom_matrix_cut)
+                if matrix_cut_bounds_sec is None:
+                    raise ValueError(
+                        "Summary cache does not contain custom-cut metadata but --custom_matrix_cut was provided."
+                    )
+                cached_bounds = (
+                    matrix_cut_bounds_sec[0],
+                    matrix_cut_bounds_sec[1],
+                    matrix_cut_bounds_sec[2],
+                    matrix_cut_bounds_sec[3],
+                )
+                if not np.allclose(cached_bounds, requested_bounds, atol=1e-3):
+                    raise ValueError(
+                        "Requested --custom_matrix_cut does not match the settings stored in the summary cache."
                     )
 
             # Attempt to recover matrix extent (seconds) from cached settings
@@ -1153,6 +1376,7 @@ def main() -> int:
                 matrix_significance_masks=matrix_significance_masks,
                 locked_to_word_onset=locked_to_word_onset_cached,
                 matrix_extent_sec=matrix_extent_sec,
+                matrix_cut_bounds_sec=matrix_cut_bounds_sec,
                 show_single_subject_curves=args.show_single_subject_curves,
             )
             LOGGER.info(
@@ -1254,6 +1478,64 @@ def main() -> int:
         except TypeError:
             analysis_parameters_template = {}
 
+    try:
+        resolution = float(analysis_parameters_template["resolution_hz"])
+    except KeyError as exc:
+        raise KeyError(
+            "analysis_parameters must include resolution_hz to compute lag axes at the group level."
+        ) from exc
+    averaging_window_tps = int(analysis_parameters_template.get("averaging_window_tps", 0))
+    if averaging_window_tps <= 0:
+        raise ValueError(
+            "analysis_parameters must include averaging_window_tps > 0 to derive lag curves."
+        )
+
+    custom_matrix_cut_config: Optional[Dict[str, Any]] = None
+    matrix_cut_bounds_sec: Optional[Tuple[float, float, float, float]] = None
+    if args.custom_matrix_cut:
+        custom_matrix_cut_config = _resolve_custom_matrix_cut_config(
+            args.custom_matrix_cut,
+            analysis_parameters_template,
+        )
+        neural_bounds_sec = custom_matrix_cut_config["neural_seconds"]
+        model_bounds_sec = custom_matrix_cut_config["model_seconds"]
+        matrix_cut_bounds_sec = (
+            neural_bounds_sec[0],
+            neural_bounds_sec[1],
+            model_bounds_sec[0],
+            model_bounds_sec[1],
+        )
+        LOGGER.info(
+            "Restricting lag/matrix statistics to neural %.3f–%.3fs and model %.3f–%.3fs segments.",
+            neural_bounds_sec[0],
+            neural_bounds_sec[1],
+            model_bounds_sec[0],
+            model_bounds_sec[1],
+        )
+        custom_cut_suffix = _format_custom_cut_suffix(neural_bounds_sec, model_bounds_sec)
+        output_path = _with_suffix(output_path, custom_cut_suffix)
+        summary_cache = _with_suffix(summary_cache, custom_cut_suffix)
+        vector_output_path = output_path.with_suffix(".pdf")
+
+        original_lag_axis_reference = lag_axis_reference
+        lag_curves_stack, lag_axis_reference = _recompute_lag_curves_with_custom_cut(
+            matrices_stack,
+            averaging_window_tps,
+            custom_matrix_cut_config["neural_slice"],
+            custom_matrix_cut_config["model_slice"],
+        )
+        if original_lag_axis_reference is not None:
+            original_span_sec = (
+                original_lag_axis_reference[-1] - original_lag_axis_reference[0]
+            ) / resolution
+            new_span_sec = (lag_axis_reference[-1] - lag_axis_reference[0]) / resolution
+            if new_span_sec < original_span_sec:
+                LOGGER.info(
+                    "Lag axis truncated from %.3fs to %.3fs due to the requested custom cut.",
+                    original_span_sec,
+                    new_span_sec,
+                )
+
     permutation_alpha_caption_value = f"{args.permutation_alpha} ({CLUSTER_PERMUTATION_TAIL_DESCRIPTION})"
     base_caption_entries: List[Tuple[str, Any]] = [
         ("lag_metric", args.lag_metric),
@@ -1269,8 +1551,15 @@ def main() -> int:
     ]
     if args.simulation_noise:
         base_caption_entries.append(("simulation_neural_label", args.simulation_neural_label))
+    if matrix_cut_bounds_sec is not None:
+        neural_min, neural_max, model_min, model_max = matrix_cut_bounds_sec
+        base_caption_entries.append(
+            (
+                "custom_matrix_cut_seconds",
+                f"neural=[{neural_min:.3f}, {neural_max:.3f}], model=[{model_min:.3f}, {model_max:.3f}]",
+            )
+        )
 
-    resolution = metadata_template["analysis_parameters"]["resolution_hz"]
     lags_sec = lag_axis_reference / resolution
     n_neural = matrices_stack.shape[1]
 
@@ -1310,12 +1599,44 @@ def main() -> int:
                         f"Failed to downsample matrices for model '{args.models[model_idx]}' "
                         f"with factor {matrix_downsample_factor}: {exc}"
                     ) from exc
-                matrix_significant_coarse, _ = permutation_cluster_test_matrix(
-                    matrix_stack_down,
-                    cluster_alpha=args.cluster_alpha,
-                    permutation_alpha=args.permutation_alpha,
-                    n_permutations=args.n_permutations,
-                )
+                if custom_matrix_cut_config is not None:
+                    neural_idx_bounds = custom_matrix_cut_config["neural_indices"]
+                    model_idx_bounds = custom_matrix_cut_config["model_indices"]
+                    ds_neural_slice = _indices_to_downsample_slice(
+                        neural_idx_bounds[0],
+                        neural_idx_bounds[1],
+                        matrix_downsample_factor,
+                        matrix_stack_down.shape[1],
+                    )
+                    ds_model_slice = _indices_to_downsample_slice(
+                        model_idx_bounds[0],
+                        model_idx_bounds[1],
+                        matrix_downsample_factor,
+                        matrix_stack_down.shape[2],
+                    )
+                    if (ds_neural_slice.stop - ds_neural_slice.start) < 2 or (
+                        ds_model_slice.stop - ds_model_slice.start
+                    ) < 2:
+                        raise ValueError(
+                            "--custom_matrix_cut collapses below two samples after matrix downsampling; "
+                            "use a smaller --matrix-downsample-factor or widen the cut window."
+                        )
+                    matrix_stack_down_cut = matrix_stack_down[:, ds_neural_slice, ds_model_slice]
+                    matrix_significant_patch, _ = permutation_cluster_test_matrix(
+                        matrix_stack_down_cut,
+                        cluster_alpha=args.cluster_alpha,
+                        permutation_alpha=args.permutation_alpha,
+                        n_permutations=args.n_permutations,
+                    )
+                    matrix_significant_coarse = np.zeros_like(matrix_stack_down[0], dtype=bool)
+                    matrix_significant_coarse[ds_neural_slice, ds_model_slice] = matrix_significant_patch
+                else:
+                    matrix_significant_coarse, _ = permutation_cluster_test_matrix(
+                        matrix_stack_down,
+                        cluster_alpha=args.cluster_alpha,
+                        permutation_alpha=args.permutation_alpha,
+                        n_permutations=args.n_permutations,
+                    )
                 matrix_significant_full = _upsample_matrix_mask(
                     matrix_significant_coarse,
                     matrix_downsample_factor,
@@ -1346,6 +1667,7 @@ def main() -> int:
             locked_to_word_onset=locked_to_word_onset,
             matrix_extent_sec=(0.0, float(analysis_parameters_template.get("subsample_tps", matrices_neural.shape[-1]) / resolution),
                                0.0, float(analysis_parameters_template.get("subsample_tps", matrices_neural.shape[-1]) / resolution)),
+            matrix_cut_bounds_sec=matrix_cut_bounds_sec,
             show_single_subject_curves=args.show_single_subject_curves,
         )
 
@@ -1381,6 +1703,17 @@ def main() -> int:
             analysis_settings["simulations_dir"] = str(analysis_root / "simulations")
             if group_level_dir is not None:
                 analysis_settings["group_level_dir"] = str(group_level_dir)
+        if custom_matrix_cut_config is not None:
+            analysis_settings["custom_matrix_cut"] = {
+                "seconds": {
+                    "neural": list(custom_matrix_cut_config["neural_seconds"]),
+                    "model": list(custom_matrix_cut_config["model_seconds"]),
+                },
+                "indices": {
+                    "neural": list(custom_matrix_cut_config["neural_indices"]),
+                    "model": list(custom_matrix_cut_config["model_indices"]),
+                },
+            }
         np.savez_compressed(
             summary_cache_neural,
             avg_matrices=avg_matrices,

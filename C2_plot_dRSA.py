@@ -3,7 +3,7 @@ import json
 import os
 import textwrap
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,8 +21,10 @@ from functions.generic_helpers import (
 def bootstrap_mean_ci(data, n_bootstraps=1000, confidence=0.95, random_state=None):
     """Compute bootstrap confidence interval for the mean curve."""
     curves = np.asarray(data)
+    if curves.ndim == 1:
+        curves = curves[np.newaxis, :]
     if curves.ndim != 2:
-        raise ValueError("`data` must be 2D (samples, points).")
+        raise ValueError("`data` must be 1D or 2D (samples, points).")
     if curves.shape[0] == 0:
         raise ValueError("No samples available for bootstrapping.")
 
@@ -253,18 +255,52 @@ def discover_metadata_files(
     base_run_id: str,
     include_base: bool = True,
     include_simulations: bool = True,
+    fallback_prefix: str | None = None,
 ) -> list[Path]:
-    """Return metadata files for the requested run id within a directory."""
+    """Return metadata files for the requested run id within a directory.
+
+    When ``fallback_prefix`` is provided and no exact matches are found, the
+    search falls back to any metadata files whose name starts with the prefix.
+    This allows analyses that swap out the RSA method name (e.g., elasticnet,
+    ridge, PCR) to be discovered without having to specify the exact suffix.
+    """
+
+    def _classify_candidates(paths: Iterable[Path]) -> list[Path]:
+        """Return ordered candidates (base first) filtered by run type."""
+
+        base_candidates: list[Path] = []
+        sim_candidates: list[Path] = []
+        for candidate in sorted(paths):
+            stem = candidate.stem
+            if stem.endswith("_metadata"):
+                stem = stem[: -len("_metadata")]
+            is_sim = "_sim_" in stem
+            if is_sim:
+                if include_simulations:
+                    sim_candidates.append(candidate)
+            else:
+                if include_base:
+                    base_candidates.append(candidate)
+        return base_candidates + sim_candidates
+
     results_dir = Path(results_dir)
     metadata_files: list[Path] = []
+    exact_matches: list[Path] = []
     if include_base:
         base_metadata = results_dir / f"{base_run_id}_metadata.json"
         if base_metadata.exists():
-            metadata_files.append(base_metadata)
+            exact_matches.append(base_metadata)
     if include_simulations:
         sim_pattern = f"{base_run_id}_sim_*_metadata.json"
-        metadata_files.extend(sorted(results_dir.glob(sim_pattern)))
-    return metadata_files
+        exact_matches.extend(results_dir.glob(sim_pattern))
+    metadata_files.extend(_classify_candidates(exact_matches))
+
+    if metadata_files or fallback_prefix is None:
+        return metadata_files
+
+    fallback_pattern = f"{fallback_prefix}_*_metadata.json"
+    fallback_candidates = results_dir.glob(fallback_pattern)
+    return _classify_candidates(fallback_candidates)
 
 
 def generate_autocorr_summary_plot(
@@ -590,6 +626,8 @@ def main():
             args.rsa_method,
         )
 
+    analysis_run_prefix = f"{subject_label}_res{args.resolution}"
+
     analysis_root: Optional[Path] = None
     analysis_name = args.analysis_name
 
@@ -655,13 +693,18 @@ def main():
     else:
         for directory, include_base, include_sim in directories:
             metadata_files = discover_metadata_files(
-                directory, analysis_run_id, include_base, include_sim
+                directory,
+                analysis_run_id,
+                include_base,
+                include_sim,
+                fallback_prefix=analysis_run_prefix,
             )
             metadata_jobs.extend((path, directory) for path in metadata_files)
 
     if not metadata_jobs:
         raise FileNotFoundError(
-            f"No metadata files found for run id '{analysis_run_id}'. "
+            f"No metadata files found for run id '{analysis_run_id}' "
+            f"(prefix '{analysis_run_prefix}'). "
             "Ensure C1_dRSA_run.py (with or without --simulation) has produced outputs."
         )
 

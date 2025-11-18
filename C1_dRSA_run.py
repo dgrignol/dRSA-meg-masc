@@ -509,7 +509,7 @@ def _resolve_model_borders(model_labels):
         model_regression_borders.get(lbl, args.regression_border_threshold)
         for lbl in model_labels
     ]
-# 0.05 0.1 0.1 0.3 0.1 0.05 0.2
+
 _register_model(envelope_path, "Envelope", "euclidean", regression_border=0.05)
 _register_model(voicing_path, "Phoneme Voicing", "euclidean", regression_border=0.05)
 _register_model(wordfreq_path, "Word Frequency", "euclidean", regression_border=0.2)
