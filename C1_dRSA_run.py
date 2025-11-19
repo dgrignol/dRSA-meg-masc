@@ -66,6 +66,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--n-subsamples",
+        type=int,
+        default=70,
+        help="Number of subsamples/windows per iteration (default: 70).",
+    )
+    parser.add_argument(
+        "--subsampling-iterations",
+        type=int,
+        default=80,
+        help="Number of subsampling iterations to average (default: 80).",
+    )
+    parser.add_argument(
+        "--subsample-duration-sec",
+        type=float,
+        default=5.0,
+        help="Length of each subsample window in seconds (default: 5).",
+    )
+    parser.add_argument(
+        "--averaging-window-sec",
+        type=float,
+        default=3.0,
+        help="Half-width of the diagonal averaging window in seconds (default: 3).",
+    )
+    parser.add_argument(
         "--regression-method",
         choices=("correlation", "pcr", "ridge", "lasso", "elasticnet"),
         default="elasticnet",
@@ -155,6 +179,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "locking and coverage."
         ),
     )
+    parser.add_argument(
+        "--sensor-subset",
+        dest="sensor_subsets",
+        action="append",
+        default=[],
+        help=(
+            "Name of a sensor subset file under derivatives/channels_selection (omit extension). "
+            "Repeat to include multiple subsets (default: none)."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-subset-mode",
+        choices=("all", "whole", "left", "right"),
+        default="all",
+        help=(
+            "Which derived subset(s) to create from each sensor subset file: "
+            "all=whole+left+right (default), or a single split."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -185,6 +228,98 @@ def log(message: str) -> None:
     """Print ``message`` with a timestamp prefix."""
     print(f"[{format_log_timestamp()}] {message}")
 
+
+def normalize_meg_channel_name(name: str) -> str:
+    """Normalise MEG channel labels for reliable dictionary lookups."""
+    return " ".join(name.upper().split())
+
+
+def load_meg_channel_names(
+    metadata_path: Path, repo_root: Path, fallback_channel_count: int | None = None
+) -> list[str]:
+    """Return MEG channel names referenced by the concatenated neural array."""
+
+    def _candidate_path(meg_file: str) -> Path | None:
+        candidate = Path(meg_file)
+        if candidate.exists():
+            return candidate
+        parts = candidate.parts
+        if "derivatives" in parts:
+            idx = parts.index("derivatives")
+            repaired = repo_root.joinpath(*parts[idx:])
+            if repaired.exists():
+                return repaired
+        return None
+
+    if metadata_path is not None and metadata_path.exists():
+        with metadata_path.open("r", encoding="utf-8") as fid:
+            metadata = json.load(fid)
+        for segment in metadata.get("segments", []):
+            meg_file = segment.get("meg_file")
+            if not meg_file:
+                continue
+            candidate = _candidate_path(meg_file)
+            if not candidate:
+                continue
+            try:
+                import mne
+            except ImportError as exc:  # pragma: no cover - dependency guard
+                raise RuntimeError(
+                    "Selecting MEG channel subsets requires mne to be installed."
+                ) from exc
+            raw = mne.io.read_raw_fif(candidate, preload=False, verbose="ERROR")
+            try:
+                channel_names = list(raw.ch_names)
+            finally:
+                raw.close()
+            log(f"Loaded {len(channel_names)} channel names from {candidate.name}.")
+            return channel_names
+        log(
+            f"No MEG FIF referenced in {metadata_path} could be opened; "
+            "falling back to canonical numbering."
+        )
+    else:
+        log(
+            f"Concatenation metadata not found at {metadata_path}; "
+            "falling back to canonical numbering."
+        )
+
+    if fallback_channel_count is None:
+        raise RuntimeError("Unable to determine MEG channel names for subset selection.")
+    return [f"MEG {idx:03d}" for idx in range(1, fallback_channel_count + 1)]
+
+
+def parse_sensor_subset_file(subset_name: str, repo_root: Path) -> dict[str, list[str]]:
+    """Load left/right/central sensor labels from derivatives/channels_selection/<name>.txt."""
+    subset_path = repo_root / "derivatives" / "channels_selection" / f"{subset_name}.txt"
+    if not subset_path.exists():
+        raise FileNotFoundError(
+            f"Sensor subset file not found: {subset_path} (requested subset: {subset_name})"
+        )
+
+    sections = {"left": [], "right": [], "central": []}
+    current = None
+    with subset_path.open("r", encoding="utf-8") as fid:
+        for raw_line in fid:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            lowered = line.lower()
+            if lowered == "[left]":
+                current = "left"
+                continue
+            if lowered == "[right]":
+                current = "right"
+                continue
+            if lowered == "[central]":
+                current = "central"
+                continue
+            if current is None:
+                # Ignore leading metadata lines (e.g., subject/task/timestamp) before the first section.
+                continue
+            sections[current].append(line)
+
+    return sections
 
 @dataclass
 class RDMSeriesBuffer:
@@ -260,6 +395,14 @@ if args.progress_log_every <= 0:
     raise ValueError("--progress-log-every must be a positive integer.")
 if args.progress_neural_step <= 0:
     raise ValueError("--progress-neural-step must be a positive integer.")
+if args.n_subsamples <= 1:
+    raise ValueError("--n-subsamples must be greater than 1.")
+if args.subsampling_iterations <= 0:
+    raise ValueError("--subsampling-iterations must be positive.")
+if args.subsample_duration_sec <= 0:
+    raise ValueError("--subsample-duration-sec must be positive.")
+if args.averaging_window_sec <= 0:
+    raise ValueError("--averaging-window-sec must be positive.")
 if args.subsample_index_shuffle and not args.simulation_meg_like_noise:
     raise ValueError("--subsample-index-shuffle requires --simulation-meg-like-noise.")
 meg_like_modes_requested = args.subsample_index_shuffle
@@ -592,14 +735,90 @@ lag_bootstrap_random_state = 0
 
 selected_neural_data = neural_data
 
+channel_names = load_meg_channel_names(
+    concatenation_metadata_path,
+    repo_root,
+    selected_neural_data.shape[0],
+)
+channel_lookup = {
+    normalize_meg_channel_name(name): idx for idx, name in enumerate(channel_names)
+}
+
+def _unique_preserve_order(sensors):
+    seen = set()
+    ordered = []
+    for sensor in sensors:
+        norm = normalize_meg_channel_name(sensor)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        ordered.append(sensor)
+    return ordered
+
+
+def _resolve_indices(sensor_list, subset_label, side_label):
+    missing = []
+    indices = []
+    seen_norm = set()
+    for sensor in sensor_list:
+        norm = normalize_meg_channel_name(sensor)
+        if norm in seen_norm:
+            continue
+        seen_norm.add(norm)
+        idx = channel_lookup.get(norm)
+        if idx is None:
+            missing.append(sensor)
+            continue
+        indices.append(idx)
+    if missing:
+        log(
+            f"Warning: subset '{subset_label}' ({side_label}) missing channels: "
+            + ", ".join(sorted(missing))
+        )
+    return indices
+
+
 neural_rdm_metric = 'correlation'
 
-# Hard-coded neural subsets (currently three identical MEG datasets).
+# Neural subsets: full MEG plus optional CLI-driven sensor subsets.
 default_neural_signal_sets = [
     ("MEG Full 1", selected_neural_data),
-#    ("MEG Full 2", selected_neural_data), # this is just a placeholder for now, disabled to reduce runtime
-#    ("MEG Full 3", selected_neural_data), # this is just a placeholder for now, disabled to reduce runtime
 ]
+
+sensor_subset_mode = args.sensor_subset_mode
+if args.sensor_subsets:
+    log(
+        f"Loading {len(args.sensor_subsets)} sensor subset(s) with mode '{sensor_subset_mode}'."
+    )
+
+for subset_name in args.sensor_subsets:
+    sections = parse_sensor_subset_file(subset_name, repo_root)
+    left = _unique_preserve_order(sections.get("left", []))
+    right = _unique_preserve_order(sections.get("right", []))
+    central = _unique_preserve_order(sections.get("central", []))
+    log(
+        f"Subset '{subset_name}': left={len(left)}, right={len(right)}, central={len(central)}."
+    )
+
+    def _add_subset(label_suffix, sensors):
+        indices = _resolve_indices(sensors, subset_name, label_suffix)
+        if not indices:
+            log(
+                f"Warning: subset '{subset_name}' ({label_suffix}) skipped; no valid channels."
+            )
+            return
+        subset_label = f"{label_suffix}_{subset_name}" if label_suffix else subset_name
+        subset_data = selected_neural_data[indices, :]
+        default_neural_signal_sets.append((subset_label, subset_data))
+
+    if sensor_subset_mode in ("all", "whole"):
+        whole_sensors = _unique_preserve_order(left + right + central)
+        _add_subset("", whole_sensors)
+    if sensor_subset_mode in ("all", "left"):
+        _add_subset("left", left)
+    if sensor_subset_mode in ("all", "right"):
+        _add_subset("right", right)
+
 default_neural_metrics = [neural_rdm_metric for _ in default_neural_signal_sets]
 
 selected_models = [np.atleast_2d(model) for model in selected_models]  # ensure 2D arrays. If 1D, add feature axis.
@@ -622,19 +841,23 @@ if not (len(selected_models) == len(selected_models_labels) == len(model_rdm_met
 
 # ===== set parameters =====
 
-n_subsamples = 70 # e.g. 150 seconds
-subsampling_iterations = 80 # e.g. 100 seconds
+n_subsamples = args.n_subsamples
+subsampling_iterations = args.subsampling_iterations
 
-SubSampleDurSec = 5 # e.g. 5 seconds
-averaging_diagonal_time_window_sec = 3 # e.g. 3 seconds
+SubSampleDurSec = args.subsample_duration_sec
+averaging_diagonal_time_window_sec = args.averaging_window_sec
 
 resolution = 100 # in Hz - change as needed
 
 tps = selected_neural_data.shape[1]
-adtw_in_tps = averaging_diagonal_time_window_sec * resolution
+adtw_in_tps = int(round(averaging_diagonal_time_window_sec * resolution))
 # this is to avoid noisy diagonal averaging in the dRSA matrix edges
 # and also, not to use the models outside the e.g. -3 +3 window for the PCR.
-subsample_tps = SubSampleDurSec * resolution # subsample size in tps - also number of RDMs calculated for each subsample
+subsample_tps = int(round(SubSampleDurSec * resolution)) # subsample size in tps - also number of RDMs calculated for each subsample
+if subsample_tps <= 0:
+    raise ValueError("subsample_tps must be positive. Check --subsample-duration-sec.")
+if adtw_in_tps <= 0:
+    raise ValueError("averaging window in samples must be positive. Check --averaging-window-sec.")
 
 subsampling_random_state = None
 rdm_length = n_subsamples * (n_subsamples - 1) // 2

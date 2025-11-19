@@ -38,7 +38,23 @@ from meeting
 RUN NEXT:
 
 
-- [ ] python D1_group_cluster_analysis.py --analysis-name center_on_onset_overlap --subjects $(seq -w 1 27) --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm" "GPT Next-Token" "GPT Surprisal" --skip-matrix-clusters --show-single-subject-curves --custom_matrix_cut 0 5 2.5 3.5 --averaging-diagonal-window-sec 2 
+
+- [ ] python D1_group_cluster_analysis.py --analysis-name center_on_onset_overlap_occ_temp_front --subjects $(seq -w 1 27) --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GPT Next-Token" "GPT Surprisal" --skip-matrix-clusters --show-single-subject-curves --custom_matrix_cut 0 5 2.5 3.5 --averaging-diagonal-window-sec 2 
+
+- [x] try inverting left electrodes with: 
+        if label_suffix == "left":
+            subset_data = -subset_data
+            print(f"Inverting left {subset_label} subset to try out.")
+     then run: qsub -t 1-27 -N C1_dRSA_sub01_occ_temp_front_invLeft s2_submit_C1_subject.sh --   --analysis-name center_on_onset_overlap_occ_temp_front_invLeft   --lock-subsample-to-word-onset   --word-onset-alignment center   --allow-overlap --regression-method correlation --sensor-subset occipito-temporo-frontal --sensor-subset-mode all
+     Your job-array 87577.1-27:1 ("C1_dRSA_sub01_occ_temp_front_invLeft") has been submitted
+
+
+
+- [x] python D1_group_cluster_analysis.py --analysis-name center_on_onset_overlap_occ_temp_front --subjects $(seq -w 1 27) --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GPT Next-Token" "GPT Surprisal" --skip-matrix-clusters --show-single-subject-curves --custom_matrix_cut 0 5 2.5 3 --averaging-diagonal-window-sec 2 
+
+- [x] python D1_group_cluster_analysis.py --analysis-name center_on_onset_overlap_chans --subjects $(seq -w 1 27) --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GPT Next-Token" "GPT Surprisal" --skip-matrix-clusters --show-single-subject-curves --custom_matrix_cut 0 5 2.5 3.5 --averaging-diagonal-window-sec 2 
+
+- [x] python D1_group_cluster_analysis.py --analysis-name center_on_onset_overlap --subjects $(seq -w 1 27) --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm" "GPT Next-Token" "GPT Surprisal" --skip-matrix-clusters --show-single-subject-curves --custom_matrix_cut 0 5 2.5 3.5 --averaging-diagonal-window-sec 2 
 
 
  - [ ] After tuning go with elastic net locked to onset 
@@ -79,8 +95,11 @@ qsub -v ANALYSIS_NAME=elasticnet_alpha0p01_l1ratio0p7,DRSA_MODELS="Envelope,Phon
      s2_submit_C1_subject.sh -- --regression-method elasticnet --regression-alpha 0.01 --regression-l1-ratio 0.7 --progress-log-every 1 --progress-neural-step 1
 - > logs/C1_dRSA.87552.1.out
 
-- [ ] alpha 0.005; l1-ratio 0.7 
+- [x] alpha 0.005; l1-ratio 0.7 
 qsub -v ANALYSIS_NAME=elasticnet_alpha0p005_l1ratio0p7,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal" \
      -t 1 \
      s2_submit_C1_subject.sh -- --regression-method elasticnet --regression-alpha 0.01 --regression-l1-ratio 0.7 --progress-log-every 1 --progress-neural-step 1
 - > logs/C1_dRSA.87553.1.out
+
+
+
