@@ -732,5 +732,34 @@ Run a lightweight C1 analysis that only includes the GPT models and locks subsam
   ```
   - Use the same `--word-onset-alignment start` suffix here if you prefer start-aligned windows.
 
+### visualisation_layout.py – interactive MEG sensor selector
+Need a quick way to inspect the MEG array and write down channel subsets? `visualisation_layout.py` loads the KIT digitiser files for `sub-XX/ses-0`, aligns them to `fsaverage`, and opens an interactive PyVista scene where you can rotate, zoom, and toggle channels with the mouse.
+
+1. **Basic usage**
+   ```bash
+   source .venv/bin/activate
+   python visualisation_layout.py --subject 01 --session 0 --task 0
+   ```
+   - Left drag = rotate, scroll = zoom, **right click** a sensor to toggle it (red = selected).
+   - When you close the window the script prints the chosen channel names and writes them to `derivatives/channels_selection/selection_sub-01_ses-0_task-0_run-none_<timestamp>.txt`.
+   - Saved files contain `[Left]`, `[Right]`, and `[Central]` blocks (determined from the MEG X coordinate); useful for copy/paste into configs.
+
+2. **Key CLI options**
+   - `--sensors-only` – skip the heavy fsaverage mesh and show just the helmet (faster when you only need channels).
+   - `--surface-subject` / `--subjects-dir` – override the FreeSurfer subject and `SUBJECTS_DIR` used for the background brain (default: auto-downloaded `fsaverage`, scaled by +20 % to prevent clipping).
+   - `--point-size`, `--opacity` – tweak marker size or mesh translucency.
+   - `--replot-selected PATH_OR_NAME` – preload a previous selection file; channels in the file are already highlighted when the window opens. You can pass either an absolute path or the basename stored inside `derivatives/channels_selection/`.
+   - Standard BIDS selectors (`--subject`, `--session`, `--task`, `--run`) tell the script which MEG directory to pull from. All other participants reuse the same layout, so swapping IDs is enough.
+
+3. **Selection workflow**
+   - Run once with the default options, pick your channels, and note the filename printed at the end.
+   - Re-run with `--replot-selected selection_sub-01_ses-0_task-0_run-none_20250101-120000.txt` to start from that set and refine it.
+   - Each run overwrites nothing: you always get a new timestamped file plus the console printout.
+
+4. **Troubleshooting**
+   - If the brain does not appear (or you only care about sensors), add `--sensors-only`.
+   - Use `--replot-selected` with the latest filename if you want to edit a previous choice—no need to re-click everything.
+   - The script pulls digitiser info directly from `sub-XX_ses-0_acq-ELP/HSP_headshape.pos` and `*_markers.mrk`; confirm those exist if you ever see “Unable to obtain a head↔MRI transform…”.
+
 Happy analysing!
 - **Border QC helper**: after a run completes, use `python check_regr_boarder.py <analysis_name>` to overlay custom thresholds (edited directly inside `check_regr_boarder.py`) on top of the cached autocorrelation curves saved in `single_subjects/cache/regression_borders/`. The script loads the `.npz` data exported alongside each PNG, recomputes the border for the scripted thresholds, and writes comparison plots to `inspect_borders_*` folders. Pass `--metadata path/to/_metadata.json` when an analysis contains multiple subject runs, and optionally override the default threshold via `--default-threshold`.
