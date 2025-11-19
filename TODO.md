@@ -37,22 +37,12 @@ from meeting
 
 RUN NEXT:
 
-TUNING ELASTICNET PARAMETERS:
-- [ ] alpha 0.05; l1-ratio 0.7 
-qsub -v ANALYSIS_NAME=elasticnet_alpha0p05_l1ratio0p7,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal" \
-     -t 1 \
-     s2_submit_C1_subject.sh -- --regression-method elasticnet --regression-alpha 0.05 --regression-l1-ratio 0.7 --progress-log-every 1 --progress-neural-step 1
-- > logs/C1_dRSA.87551.1.out
 
-- [ ] alpha 0.01; l1-ratio 0.7 
-qsub -v ANALYSIS_NAME=elasticnet_alpha0p01_l1ratio0p7,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal" \
-     -t 1 \
-     s2_submit_C1_subject.sh -- --regression-method elasticnet --regression-alpha 0.01 --regression-l1-ratio 0.7 --progress-log-every 1 --progress-neural-step 1
-- > logs/C1_dRSA.87552.1.out
+- [ ] python D1_group_cluster_analysis.py --analysis-name center_on_onset_overlap --subjects $(seq -w 1 27) --models "Envelope" "Phoneme Voicing" "Word Frequency" "GloVe" "GloVe Norm" "GPT Next-Token" "GPT Surprisal" --skip-matrix-clusters --show-single-subject-curves --custom_matrix_cut 0 5 2.5 3.5 --averaging-diagonal-window-sec 2 
 
 
-
- - [ ] qsub -v ANALYSIS_NAME=elasticnet_nolock_nooverlap,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal"      -t 2-27      s2_submit_C1_subject.sh      -- --regression-method elasticnet --progress-log-every 1 --progress-neural-step 1
+ - [ ] After tuning go with elastic net locked to onset 
+ qsub -v ANALYSIS_NAME=elasticnet_nolock_nooverlap,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal"      -t 2-27      s2_submit_C1_subject.sh      -- --regression-method elasticnet --progress-log-every 1 --progress-neural-step 1
 
 - [x] qsub -v ANALYSIS_NAME=elasticnet_nolock_nooverlap,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal"      -t 1      s2_submit_C1_subject.sh      -- --regression-method elasticnet --progress-log-every 1 --progress-neural-step 1
 
@@ -76,3 +66,21 @@ try new dRSA matrix permutation
 
 
 
+TUNING ELASTICNET PARAMETERS:
+- [x] alpha 0.05; l1-ratio 0.7
+qsub -v ANALYSIS_NAME=elasticnet_alpha0p05_l1ratio0p7,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal" \
+     -t 1 \
+     s2_submit_C1_subject.sh -- --regression-method elasticnet --regression-alpha 0.05 --regression-l1-ratio 0.7 --progress-log-every 1 --progress-neural-step 1
+- > logs/C1_dRSA.87551.1.out
+
+- [x] alpha 0.01; l1-ratio 0.7 
+qsub -v ANALYSIS_NAME=elasticnet_alpha0p01_l1ratio0p7,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal" \
+     -t 1 \
+     s2_submit_C1_subject.sh -- --regression-method elasticnet --regression-alpha 0.01 --regression-l1-ratio 0.7 --progress-log-every 1 --progress-neural-step 1
+- > logs/C1_dRSA.87552.1.out
+
+- [ ] alpha 0.005; l1-ratio 0.7 
+qsub -v ANALYSIS_NAME=elasticnet_alpha0p005_l1ratio0p7,DRSA_MODELS="Envelope,Phoneme Voicing,Word Frequency,GloVe,GPT Next-Token,GPT Surprisal" \
+     -t 1 \
+     s2_submit_C1_subject.sh -- --regression-method elasticnet --regression-alpha 0.01 --regression-l1-ratio 0.7 --progress-log-every 1 --progress-neural-step 1
+- > logs/C1_dRSA.87553.1.out

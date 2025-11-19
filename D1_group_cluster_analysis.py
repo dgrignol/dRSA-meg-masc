@@ -148,6 +148,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--averaging-diagonal-window-sec",
+        type=float,
+        default=None,
+        help=(
+            "Override the diagonal averaging half-window (in seconds) used to build lag curves and"
+            " run lag-level statistics. When omitted, the per-subject metadata value is used."
+        ),
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -761,6 +770,18 @@ def _resolve_custom_matrix_cut_config(
     _validate_bounds("neural", min_neural, max_neural)
     _validate_bounds("model", min_model, max_model)
 
+    if not (
+        np.isclose(min_neural, min_model) and np.isclose(max_neural, max_model)
+    ):
+        LOGGER.warning(
+            "--custom_matrix_cut neural/model limits differ (neural %.3f–%.3f vs model %.3f–%.3f)."
+            " Lag-zero will be realigned to the main diagonal of the original matrix.",
+            min_neural,
+            max_neural,
+            min_model,
+            max_model,
+        )
+
     def _sec_to_indices(start_sec: float, end_sec: float) -> Tuple[int, int]:
         start_idx = max(0, int(np.floor(start_sec * resolution_hz)))
         stop_idx = min(subsample_tps, int(np.ceil(end_sec * resolution_hz)))
@@ -776,6 +797,8 @@ def _resolve_custom_matrix_cut_config(
     neural_bounds = (neural_idx[0] / resolution_hz, neural_idx[1] / resolution_hz)
     model_bounds = (model_idx[0] / resolution_hz, model_idx[1] / resolution_hz)
 
+    lag_offset_tp = neural_idx[0] - model_idx[0]
+
     return {
         "neural_seconds": neural_bounds,
         "model_seconds": model_bounds,
@@ -783,6 +806,8 @@ def _resolve_custom_matrix_cut_config(
         "model_indices": model_idx,
         "neural_slice": slice(neural_idx[0], neural_idx[1]),
         "model_slice": slice(model_idx[0], model_idx[1]),
+        "lag_offset_tp": lag_offset_tp,
+        "lag_offset_sec": lag_offset_tp / resolution_hz,
     }
 
 
@@ -799,13 +824,56 @@ def _indices_to_downsample_slice(
     return slice(start, stop)
 
 
+def _compute_lag_curve_for_window(
+    matrix: np.ndarray,
+    neural_slice: slice,
+    model_slice: slice,
+    max_lag: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute lag curves restricted to neural/model slices while anchoring zero to the main diagonal."""
+
+    matrix = np.asarray(matrix)
+    if matrix.ndim != 2:
+        raise ValueError(
+            f"Expected 2D matrix for lag computation; received array with shape {matrix.shape}."
+        )
+    max_lag = int(max_lag)
+    if max_lag < 1:
+        raise ValueError("averaging window must span at least one time-point for lag computation.")
+
+    neural_indices = np.arange(neural_slice.start, neural_slice.stop)
+    model_start = model_slice.start
+    model_stop = model_slice.stop
+
+    lags: List[int] = []
+    values: List[float] = []
+    for lag in range(-max_lag, max_lag + 1):
+        model_indices = neural_indices - lag
+        valid_mask = (model_indices >= model_start) & (model_indices < model_stop)
+        if not np.any(valid_mask):
+            continue
+        rows = neural_indices[valid_mask]
+        cols = model_indices[valid_mask]
+        diag_vals = matrix[rows, cols]
+        values.append(float(np.nanmean(diag_vals)))
+        lags.append(lag)
+
+    if not lags:
+        raise ValueError(
+            "No overlapping samples available after applying --custom_matrix_cut and averaging window; "
+            "please widen the window or adjust the cut bounds."
+        )
+
+    return np.array(values, dtype=float), np.array(lags, dtype=int)
+
+
 def _recompute_lag_curves_with_custom_cut(
     matrices_stack: np.ndarray,
     averaging_window_tps: int,
     neural_slice: slice,
     model_slice: slice,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Derive lag curves from matrices restricted to the requested slices."""
+    """Derive lag curves from the full matrices while restricting samples to the requested slices."""
 
     n_subjects, n_neural, n_models = matrices_stack.shape[:3]
     recomputed_curves: List[np.ndarray] = []
@@ -817,9 +885,10 @@ def _recompute_lag_curves_with_custom_cut(
             model_curves: List[np.ndarray] = []
             for model_idx in range(n_models):
                 matrix = matrices_stack[subj_idx, neural_idx, model_idx]
-                matrix_cut = matrix[neural_slice, model_slice]
-                lag_curve, lags_tp = compute_lag_curve_from_matrix(
-                    matrix_cut,
+                lag_curve, lags_tp = _compute_lag_curve_for_window(
+                    matrix,
+                    neural_slice,
+                    model_slice,
                     averaging_window_tps,
                 )
                 if lag_axis_reference is None:
@@ -835,7 +904,7 @@ def _recompute_lag_curves_with_custom_cut(
         recomputed_curves.append(np.array(neural_curves))
 
     if lag_axis_reference is None:
-        raise RuntimeError("Failed to compute lag axis after applying custom matrix cut.")
+        raise RuntimeError("Failed to compute lag axis after applying custom settings.")
 
     return np.array(recomputed_curves), lag_axis_reference
 
@@ -1277,6 +1346,7 @@ def main() -> int:
             vector_output_local = vector_output_path
             locked_to_word_onset_cached = False
             matrix_cut_bounds_sec = None
+            cached_window_sec = None
             if isinstance(analysis_settings, dict):
                 output_path_local = _resolve_output_path(
                     analysis_settings.get("output_path"), output_path_local
@@ -1302,6 +1372,17 @@ def main() -> int:
                             )
                     except (TypeError, ValueError):
                         matrix_cut_bounds_sec = None
+                ap_cached = analysis_settings.get("analysis_parameters")
+                if isinstance(ap_cached, dict):
+                    cached_window_sec = ap_cached.get("averaging_diagonal_time_window_sec")
+                    if cached_window_sec is None:
+                        try:
+                            aw_tps = float(ap_cached.get("averaging_window_tps"))
+                            res_hz = float(ap_cached.get("resolution_hz"))
+                            if res_hz > 0:
+                                cached_window_sec = aw_tps / res_hz
+                        except (TypeError, ValueError):
+                            cached_window_sec = None
             else:
                 suffix = ""
                 if cache_path.stem.startswith(summary_cache.stem):
@@ -1328,6 +1409,15 @@ def main() -> int:
                 if not np.allclose(cached_bounds, requested_bounds, atol=1e-3):
                     raise ValueError(
                         "Requested --custom_matrix_cut does not match the settings stored in the summary cache."
+                    )
+            if args.averaging_diagonal_window_sec is not None:
+                if cached_window_sec is None or not np.isclose(
+                    cached_window_sec,
+                    args.averaging_diagonal_window_sec,
+                    atol=1e-4,
+                ):
+                    raise ValueError(
+                        "Summary cache was generated with a different averaging window; rerun without --plot-only."
                     )
 
             # Attempt to recover matrix extent (seconds) from cached settings
@@ -1478,6 +1568,25 @@ def main() -> int:
             "analysis_parameters must include averaging_window_tps > 0 to derive lag curves."
         )
 
+    averaging_window_override_sec = args.averaging_diagonal_window_sec
+    if averaging_window_override_sec is not None:
+        if averaging_window_override_sec <= 0:
+            raise ValueError("--averaging-diagonal-window-sec must be positive when provided.")
+        override_tps = max(1, int(round(averaging_window_override_sec * resolution)))
+        if override_tps != averaging_window_tps:
+            LOGGER.info(
+                "Overriding averaging window from %d TPs (%.3fs) to %d TPs (%.3fs).",
+                averaging_window_tps,
+                averaging_window_tps / resolution,
+                override_tps,
+                override_tps / resolution,
+            )
+        averaging_window_tps = override_tps
+
+    averaging_window_sec = averaging_window_tps / resolution
+    analysis_parameters_template["averaging_window_tps"] = averaging_window_tps
+    analysis_parameters_template["averaging_diagonal_time_window_sec"] = averaging_window_sec
+
     custom_matrix_cut_config: Optional[Dict[str, Any]] = None
     matrix_cut_bounds_sec: Optional[Tuple[float, float, float, float]] = None
     if args.custom_matrix_cut:
@@ -1505,21 +1614,29 @@ def main() -> int:
         summary_cache = _with_suffix(summary_cache, custom_cut_suffix)
         vector_output_path = output_path.with_suffix(".pdf")
 
-        original_lag_axis_reference = lag_axis_reference
+    original_lag_axis_reference = lag_axis_reference
+    need_recompute_lag_curves = bool(args.custom_matrix_cut) or (
+        averaging_window_override_sec is not None
+    )
+    matrix_dim = matrices_stack.shape[-1]
+    full_slice = slice(0, matrix_dim)
+    if need_recompute_lag_curves:
+        neural_slice = custom_matrix_cut_config["neural_slice"] if custom_matrix_cut_config else full_slice
+        model_slice = custom_matrix_cut_config["model_slice"] if custom_matrix_cut_config else full_slice
         lag_curves_stack, lag_axis_reference = _recompute_lag_curves_with_custom_cut(
             matrices_stack,
             averaging_window_tps,
-            custom_matrix_cut_config["neural_slice"],
-            custom_matrix_cut_config["model_slice"],
+            neural_slice,
+            model_slice,
         )
         if original_lag_axis_reference is not None:
             original_span_sec = (
                 original_lag_axis_reference[-1] - original_lag_axis_reference[0]
             ) / resolution
             new_span_sec = (lag_axis_reference[-1] - lag_axis_reference[0]) / resolution
-            if new_span_sec < original_span_sec:
+            if not np.array_equal(original_lag_axis_reference, lag_axis_reference):
                 LOGGER.info(
-                    "Lag axis truncated from %.3fs to %.3fs due to the requested custom cut.",
+                    "Lag axis adjusted from %.3fs to %.3fs due to custom settings.",
                     original_span_sec,
                     new_span_sec,
                 )
@@ -1701,6 +1818,8 @@ def main() -> int:
                     "neural": list(custom_matrix_cut_config["neural_indices"]),
                     "model": list(custom_matrix_cut_config["model_indices"]),
                 },
+                "lag_offset_tp": custom_matrix_cut_config["lag_offset_tp"],
+                "lag_offset_sec": custom_matrix_cut_config["lag_offset_sec"],
             }
         np.savez_compressed(
             summary_cache_neural,
