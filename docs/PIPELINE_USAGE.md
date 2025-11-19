@@ -121,6 +121,7 @@ Runs the subject-level dynamic RSA analysis. In addition to the legacy streaming
   - `--results-root PATH` – parent directory that will contain the analysis folder (default: `results`).
   - `--lock-subsample-to-word-onset` – restrict subsample starts to the concatenated word onset timestamps (requires the numpy file written by A2).
   - `--word-onset-alignment {center,start}` – when locking, center windows on each onset (default) or start them at the onset to reproduce the legacy behavior.
+  - `--n-subsamples`, `--subsampling-iterations`, `--subsample-duration-sec`, `--averaging-window-sec` – override the temporal sampling parameters without editing the script (defaults: 70 subsamples × 80 iterations, 5 s windows, ±3 s averaging window).
   - `--allow-overlap` – allow subsample windows to overlap (handy when the onset density is low; compatible with and without locking).
   - `--regression-method {correlation,pcr,ridge,lasso,elasticnet}` – choose the model–neural fitting strategy (default: `elasticnet`, which isolates each model’s unique contribution by regularised multi-model regression). Set `correlation` to stream the classic Pearson metric without storing full RDM stacks.
   - `--regression-alpha` – regularisation strength for Ridge/Lasso/Elastic Net (default 1.0). Tweak per subject or pass different values via the pipeline wrapper’s `EXTRA_ARGS`.
