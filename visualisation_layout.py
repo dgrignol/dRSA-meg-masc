@@ -460,21 +460,28 @@ def _setup_plot(
             selected[name] = None
         sensor_mesh["selected"] = scalars
 
+    def _hemi_label(idx: int, tol: float = 0.005) -> str:
+        x_coord = sensor_positions[idx, 0]
+        if abs(x_coord) <= tol:
+            return "central"
+        return "right" if x_coord > 0 else "left"
+
     def _on_pick(point):
         if point is None:
             return
         distances = np.linalg.norm(sensor_positions - point, axis=1)
         idx = int(np.argmin(distances))
         name = sensor_names[idx]
+        hemi = _hemi_label(idx)
         scalars = sensor_mesh["selected"]
         if scalars[idx] > 0:
             scalars[idx] = 0
             selected.pop(name, None)
-            print(f"Removed {name}")
+            print(f"Removed {name} ({hemi})")
         else:
             scalars[idx] = 1
             selected[name] = None
-            print(f"Added {name}")
+            print(f"Added {name} ({hemi})")
         sensor_mesh["selected"] = scalars
         plotter.render()
 

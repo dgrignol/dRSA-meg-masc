@@ -179,6 +179,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "locking and coverage."
         ),
     )
+    parser.add_argument(
+        "--sensor-subset",
+        dest="sensor_subsets",
+        action="append",
+        default=[],
+        help=(
+            "Name of a sensor subset file under derivatives/channels_selection (omit extension). "
+            "Repeat to include multiple subsets (default: none)."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-subset-mode",
+        choices=("all", "whole", "left", "right"),
+        default="all",
+        help=(
+            "Which derived subset(s) to create from each sensor subset file: "
+            "all=whole+left+right (default), or a single split."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -270,225 +289,37 @@ def load_meg_channel_names(
     return [f"MEG {idx:03d}" for idx in range(1, fallback_channel_count + 1)]
 
 
-LEFT_HEMISPHERE_MEG_CHANNELS = {
-    normalize_meg_channel_name(name)
-    for name in (
-        "MEG 007",
-        "MEG 008",
-        "MEG 009",
-        "MEG 017",
-        "MEG 018",
-        "MEG 020",
-        "MEG 024",
-        "MEG 025",
-        "MEG 026",
-        "MEG 027",
-        "MEG 028",
-        "MEG 029",
-        "MEG 030",
-        "MEG 031",
-        "MEG 032",
-        "MEG 035",
-        "MEG 036",
-        "MEG 037",
-        "MEG 038",
-        "MEG 039",
-        "MEG 040",
-        "MEG 041",
-        "MEG 042",
-        "MEG 043",
-        "MEG 044",
-        "MEG 045",
-        "MEG 046",
-        "MEG 047",
-        "MEG 048",
-        "MEG 049",
-        "MEG 051",
-        "MEG 052",
-        "MEG 054",
-        "MEG 055",
-        "MEG 056",
-        "MEG 057",
-        "MEG 059",
-        "MEG 060",
-        "MEG 061",
-        "MEG 062",
-        "MEG 063",
-        "MEG 070",
-        "MEG 072",
-        "MEG 073",
-        "MEG 074",
-        "MEG 075",
-        "MEG 076",
-        "MEG 077",
-        "MEG 078",
-        "MEG 081",
-        "MEG 082",
-        "MEG 083",
-        "MEG 084",
-        "MEG 085",
-        "MEG 086",
-        "MEG 087",
-        "MEG 088",
-        "MEG 089",
-        "MEG 090",
-        "MEG 091",
-        "MEG 092",
-        "MEG 093",
-        "MEG 094",
-        "MEG 095",
-        "MEG 096",
-        "MEG 097",
-        "MEG 099",
-        "MEG 102",
-        "MEG 103",
-        "MEG 104",
-        "MEG 105",
-        "MEG 106",
-        "MEG 107",
-        "MEG 108",
-        "MEG 109",
-        "MEG 110",
-        "MEG 111",
-        "MEG 112",
-        "MEG 114",
-        "MEG 121",
-        "MEG 122",
-        "MEG 123",
-        "MEG 124",
-        "MEG 125",
-        "MEG 127",
-        "MEG 128",
-        "MEG 130",
-        "MEG 134",
-        "MEG 135",
-        "MEG 144",
-        "MEG 158",
-        "MEG 168",
-    )
-}
+def parse_sensor_subset_file(subset_name: str, repo_root: Path) -> dict[str, list[str]]:
+    """Load left/right/central sensor labels from derivatives/channels_selection/<name>.txt."""
+    subset_path = repo_root / "derivatives" / "channels_selection" / f"{subset_name}.txt"
+    if not subset_path.exists():
+        raise FileNotFoundError(
+            f"Sensor subset file not found: {subset_path} (requested subset: {subset_name})"
+        )
 
-RIGHT_HEMISPHERE_MEG_CHANNELS = {
-    normalize_meg_channel_name(name)
-    for name in (
-        "MEG 001",
-        "MEG 002",
-        "MEG 003",
-        "MEG 004",
-        "MEG 005",
-        "MEG 006",
-        "MEG 010",
-        "MEG 011",
-        "MEG 012",
-        "MEG 013",
-        "MEG 014",
-        "MEG 015",
-        "MEG 016",
-        "MEG 019",
-        "MEG 021",
-        "MEG 022",
-        "MEG 023",
-        "MEG 033",
-        "MEG 034",
-        "MEG 050",
-        "MEG 053",
-        "MEG 058",
-        "MEG 064",
-        "MEG 065",
-        "MEG 066",
-        "MEG 067",
-        "MEG 068",
-        "MEG 069",
-        "MEG 071",
-        "MEG 079",
-        "MEG 080",
-        "MEG 098",
-        "MEG 100",
-        "MEG 101",
-        "MEG 113",
-        "MEG 115",
-        "MEG 116",
-        "MEG 117",
-        "MEG 118",
-        "MEG 119",
-        "MEG 120",
-        "MEG 126",
-        "MEG 129",
-        "MEG 131",
-        "MEG 132",
-        "MEG 133",
-        "MEG 136",
-        "MEG 137",
-        "MEG 138",
-        "MEG 139",
-        "MEG 140",
-        "MEG 141",
-        "MEG 142",
-        "MEG 143",
-        "MEG 145",
-        "MEG 146",
-        "MEG 147",
-        "MEG 148",
-        "MEG 149",
-        "MEG 150",
-        "MEG 151",
-        "MEG 152",
-        "MEG 153",
-        "MEG 154",
-        "MEG 155",
-        "MEG 156",
-        "MEG 157",
-        "MEG 159",
-        "MEG 160",
-        "MEG 161",
-        "MEG 162",
-        "MEG 163",
-        "MEG 164",
-        "MEG 165",
-        "MEG 166",
-        "MEG 167",
-        "MEG 169",
-        "MEG 170",
-        "MEG 171",
-        "MEG 172",
-        "MEG 173",
-        "MEG 174",
-        "MEG 175",
-        "MEG 176",
-        "MEG 177",
-        "MEG 178",
-        "MEG 179",
-        "MEG 180",
-        "MEG 181",
-        "MEG 182",
-        "MEG 183",
-        "MEG 184",
-        "MEG 185",
-        "MEG 186",
-        "MEG 187",
-        "MEG 188",
-        "MEG 189",
-        "MEG 190",
-        "MEG 191",
-        "MEG 192",
-        "MEG 193",
-        "MEG 194",
-        "MEG 195",
-        "MEG 196",
-        "MEG 197",
-        "MEG 198",
-        "MEG 199",
-        "MEG 200",
-        "MEG 201",
-        "MEG 202",
-        "MEG 203",
-        "MEG 204",
-        "MEG 205",
-        "MEG 206",
-        "MEG 207",
-        "MEG 208",
-    )
-}
+    sections = {"left": [], "right": [], "central": []}
+    current = None
+    with subset_path.open("r", encoding="utf-8") as fid:
+        for raw_line in fid:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            lowered = line.lower()
+            if lowered == "[left]":
+                current = "left"
+                continue
+            if lowered == "[right]":
+                current = "right"
+                continue
+            if lowered == "[central]":
+                current = "central"
+                continue
+            if current is None:
+                # Ignore leading metadata lines (e.g., subject/task/timestamp) before the first section.
+                continue
+            sections[current].append(line)
+
+    return sections
 
 @dataclass
 class RDMSeriesBuffer:
@@ -913,153 +744,81 @@ channel_lookup = {
     normalize_meg_channel_name(name): idx for idx, name in enumerate(channel_names)
 }
 
-parieto_occipito_frontal_sensor_names = [
-    "MEG 098",
-    "MEG 118",
-    "MEG 059",
-    "MEG 085",
-    "MEG 120",
-    "MEG 168",
-    "MEG 134",
-    "MEG 054",
-    "MEG 084",
-    "MEG 067",
-    "MEG 049",
-    "MEG 167",
-    "MEG 116",
-    "MEG 104",
-    "MEG 088",
-    "MEG 144",
-    "MEG 127",
-    "MEG 058",
-    "MEG 061",
-    "MEG 159",
-    "MEG 140",
-    "MEG 122",
-    "MEG 123",
-    "MEG 075",
-    "MEG 128",
-    "MEG 079",
-    "MEG 132",
-    "MEG 076",
-    "MEG 124",
-    "MEG 155",
-    "MEG 143",
-    "MEG 138",
-    "MEG 106",
-    "MEG 078",
-    "MEG 070",
-    "MEG 141",
-    "MEG 158",
-    "MEG 055",
-    "MEG 137",
-    "MEG 113",
-    "MEG 017",
-    "MEG 097",
-    "MEG 037",
-    "MEG 086",
-    "MEG 072",
-    "MEG 087",
-    "MEG 083",
-    "MEG 062",
-    "MEG 074",
-    "MEG 121",
-    "MEG 130",
-    "MEG 060",
-    "MEG 150",
-    "MEG 148",
-    "MEG 080",
-    "MEG 160",
-    "MEG 050",
-    "MEG 101",
-    "MEG 052",
-    "MEG 065",
-]
+def _unique_preserve_order(sensors):
+    seen = set()
+    ordered = []
+    for sensor in sensors:
+        norm = normalize_meg_channel_name(sensor)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        ordered.append(sensor)
+    return ordered
 
-missing_parieto_occipito_frontal_sensors = [
-    sensor
-    for sensor in parieto_occipito_frontal_sensor_names
-    if normalize_meg_channel_name(sensor) not in channel_lookup
-]
-if missing_parieto_occipito_frontal_sensors:
-    raise ValueError(
-        "Could not find the following sensors for the parieto-occipito-frontal subset: "
-        + ", ".join(missing_parieto_occipito_frontal_sensors)
-    )
 
-unclassified_parieto_occipito_frontal_sensors = [
-    sensor
-    for sensor in parieto_occipito_frontal_sensor_names
-    if normalize_meg_channel_name(sensor)
-    not in LEFT_HEMISPHERE_MEG_CHANNELS.union(RIGHT_HEMISPHERE_MEG_CHANNELS)
-]
-if unclassified_parieto_occipito_frontal_sensors:
-    raise ValueError(
-        "Could not determine hemisphere membership for sensors: "
-        + ", ".join(unclassified_parieto_occipito_frontal_sensors)
-    )
+def _resolve_indices(sensor_list, subset_label, side_label):
+    missing = []
+    indices = []
+    seen_norm = set()
+    for sensor in sensor_list:
+        norm = normalize_meg_channel_name(sensor)
+        if norm in seen_norm:
+            continue
+        seen_norm.add(norm)
+        idx = channel_lookup.get(norm)
+        if idx is None:
+            missing.append(sensor)
+            continue
+        indices.append(idx)
+    if missing:
+        log(
+            f"Warning: subset '{subset_label}' ({side_label}) missing channels: "
+            + ", ".join(sorted(missing))
+        )
+    return indices
 
-parieto_occipito_frontal_indices = [
-    channel_lookup[normalize_meg_channel_name(sensor)]
-    for sensor in parieto_occipito_frontal_sensor_names
-]
-parieto_occipito_frontal_neural_data = selected_neural_data[
-    parieto_occipito_frontal_indices, :
-]
-
-parieto_occipito_frontal_left_sensor_names = [
-    sensor
-    for sensor in parieto_occipito_frontal_sensor_names
-    if normalize_meg_channel_name(sensor) in LEFT_HEMISPHERE_MEG_CHANNELS
-]
-parieto_occipito_frontal_right_sensor_names = [
-    sensor
-    for sensor in parieto_occipito_frontal_sensor_names
-    if normalize_meg_channel_name(sensor) in RIGHT_HEMISPHERE_MEG_CHANNELS
-]
-
-if len(parieto_occipito_frontal_left_sensor_names) + len(
-    parieto_occipito_frontal_right_sensor_names
-) != len(parieto_occipito_frontal_sensor_names):
-    raise RuntimeError(
-        "Hemisphere split mismatch for parieto-occipito-frontal sensors; "
-        "please verify hemisphere lookup tables."
-    )
-
-parieto_occipito_frontal_left_indices = [
-    channel_lookup[normalize_meg_channel_name(sensor)]
-    for sensor in parieto_occipito_frontal_left_sensor_names
-]
-parieto_occipito_frontal_right_indices = [
-    channel_lookup[normalize_meg_channel_name(sensor)]
-    for sensor in parieto_occipito_frontal_right_sensor_names
-]
-
-parieto_occipito_frontal_left_neural_data = selected_neural_data[
-    parieto_occipito_frontal_left_indices, :
-]
-parieto_occipito_frontal_right_neural_data = selected_neural_data[
-    parieto_occipito_frontal_right_indices, :
-]
-
-log(
-    "Parieto-occipito-frontal subsets: total=%d, left=%d, right=%d"
-    % (
-        parieto_occipito_frontal_neural_data.shape[0],
-        parieto_occipito_frontal_left_neural_data.shape[0],
-        parieto_occipito_frontal_right_neural_data.shape[0],
-    )
-)
 
 neural_rdm_metric = 'correlation'
 
-# Hard-coded neural subsets (full sensor array plus a regional subset).
+# Neural subsets: full MEG plus optional CLI-driven sensor subsets.
 default_neural_signal_sets = [
     ("MEG Full 1", selected_neural_data),
-    ("Parieto-Occipito-Frontal", parieto_occipito_frontal_neural_data),
-    ("left_Parieto-Occipito-Frontal", parieto_occipito_frontal_left_neural_data),
-    ("right_Parieto-Occipito-Frontal", parieto_occipito_frontal_right_neural_data),
 ]
+
+sensor_subset_mode = args.sensor_subset_mode
+if args.sensor_subsets:
+    log(
+        f"Loading {len(args.sensor_subsets)} sensor subset(s) with mode '{sensor_subset_mode}'."
+    )
+
+for subset_name in args.sensor_subsets:
+    sections = parse_sensor_subset_file(subset_name, repo_root)
+    left = _unique_preserve_order(sections.get("left", []))
+    right = _unique_preserve_order(sections.get("right", []))
+    central = _unique_preserve_order(sections.get("central", []))
+    log(
+        f"Subset '{subset_name}': left={len(left)}, right={len(right)}, central={len(central)}."
+    )
+
+    def _add_subset(label_suffix, sensors):
+        indices = _resolve_indices(sensors, subset_name, label_suffix)
+        if not indices:
+            log(
+                f"Warning: subset '{subset_name}' ({label_suffix}) skipped; no valid channels."
+            )
+            return
+        subset_label = f"{label_suffix}_{subset_name}" if label_suffix else subset_name
+        subset_data = selected_neural_data[indices, :]
+        default_neural_signal_sets.append((subset_label, subset_data))
+
+    if sensor_subset_mode in ("all", "whole"):
+        whole_sensors = _unique_preserve_order(left + right + central)
+        _add_subset("", whole_sensors)
+    if sensor_subset_mode in ("all", "left"):
+        _add_subset("left", left)
+    if sensor_subset_mode in ("all", "right"):
+        _add_subset("right", right)
+
 default_neural_metrics = [neural_rdm_metric for _ in default_neural_signal_sets]
 
 selected_models = [np.atleast_2d(model) for model in selected_models]  # ensure 2D arrays. If 1D, add feature axis.
