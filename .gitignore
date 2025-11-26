@@ -18,6 +18,7 @@ logs/
 # BIDS dataset and derived outputs
 bids_anonym/
 derivatives/
+derivatives_old/
 results/
 
 # Example MATLAB code and generated artefacts

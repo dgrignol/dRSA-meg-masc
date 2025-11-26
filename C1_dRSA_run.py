@@ -444,6 +444,39 @@ if args.simulation or args.simulation_noise:
 elif args.simulation_meg_like_noise:
     log(f"Simulation outputs will be written to: {simulations_dir}")
 
+log("=== run configuration ===")
+log(
+    "Subsampling: "
+    f"n={args.n_subsamples}, iterations={args.subsampling_iterations}, "
+    f"duration_sec={args.subsample_duration_sec}, "
+    f"averaging_window_sec={args.averaging_window_sec}, "
+    f"lock_to_onset={args.lock_subsample_to_word_onset}, "
+    f"allow_overlap={args.allow_overlap}, "
+    f"onset_alignment={args.word_onset_alignment}"
+)
+log(
+    "Regression: "
+    f"method={args.regression_method}, alpha={args.regression_alpha}, "
+    f"l1_ratio={args.regression_l1_ratio}, border_threshold={args.regression_border_threshold}, "
+    f"plot_borders={args.plot_regression_borders}, "
+    f"mem_threshold_gb={args.regression_mem_threshold_gb}"
+)
+log(
+    "Progress logging: "
+    f"log_every={args.progress_log_every}, neural_step={args.progress_neural_step}"
+)
+log(
+    "Sensors: "
+    f"subsets={','.join(args.sensor_subsets) if args.sensor_subsets else 'none'}, "
+    f"subset_mode={args.sensor_subset_mode}"
+)
+log(
+    "Simulation flags: "
+    f"simulation={args.simulation}, noise={args.simulation_noise}, "
+    f"meg_like_noise={args.simulation_meg_like_noise}, "
+    f"subsample_index_shuffle={args.subsample_index_shuffle}"
+)
+
 # ===== load data =====
 # paths
 subject_arg = args.subject
